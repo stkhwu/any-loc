@@ -9,17 +9,18 @@ __pycache__/
 venv/
 
 # ---- PyInstaller build output ----
+# Catch any dist/ dist2/ dist_final/ build/ … the build tools spew out.
 build/
+build*/
 dist/
-build2/
-dist2/
-dist_final/
+dist*/
 *.manifest
 
 # Keep the spec (it IS source): AnyLoc.spec is tracked.
 
 # ---- macOS cruft ----
 .DS_Store
+**/.DS_Store
 
 # ---- Editor ----
 .idea/

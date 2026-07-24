@@ -35,4 +35,4 @@ echo
 
 # launcher.py itself will re-exec under sudo when it detects it's not root and
 # it's attached to a TTY (this window). Running it directly is enough.
-exec "$PY" launcher.py
+exec "$PY" src/launcher.py

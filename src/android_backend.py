@@ -62,9 +62,14 @@ def find_adb() -> str:
     base = _base_dir()
     is_win = os.name == "nt"
     exe = "adb.exe" if is_win else "adb"
+    subdir = "win" if is_win else "mac"
+    # From source the code is in src/ but vendor/ sits at the repo root (one level
+    # up), so check both base/vendor and base/../vendor.
+    parent = os.path.dirname(base)
     candidates = [
-        os.path.join(base, exe),                         # frozen: _MEIPASS root
-        os.path.join(base, "vendor", "win" if is_win else "mac", exe),  # from source
+        os.path.join(base, exe),                             # frozen: _MEIPASS root
+        os.path.join(base, "vendor", subdir, exe),           # source: web/ beside code
+        os.path.join(parent, "vendor", subdir, exe),         # source: src/ -> repo-root vendor/
     ]
     for c in candidates:
         if os.path.isfile(c):

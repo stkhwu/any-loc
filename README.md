@@ -123,7 +123,7 @@ source works on any Mac with Python.
 
 ### Command-line options (optional)
 ```bash
-python backend.py --port 8765 --no-browser -v
+python src/backend.py --port 8765 --no-browser -v
 ```
 - `--port` web UI port (default 8765)
 - `--no-connect` don't auto-connect on startup (click Connect yourself)
@@ -136,12 +136,17 @@ python backend.py --port 8765 --no-browser -v
 
 ```
 any-loc/
-├── launcher.py       all-in-one entry point (self-elevates, starts server + tunnel)
-├── backend.py        device worker + static server + JSON API (stdlib only)
-├── AnyLoc.spec       PyInstaller build spec (Windows .exe / macOS .app)
-├── requirements.txt  Python dependencies
-├── web/              the UI (index.html, app.js, i18n.js, config.js, icons)
-└── scripts/          launch & build helpers
+├── src/               all Python source
+│   ├── launcher.py       all-in-one entry point (self-elevates, starts server + tunnel)
+│   ├── backend.py        device worker + static server + JSON API (stdlib only)
+│   ├── backend_base.py   LocationBackend abstraction (shared by iOS + Android)
+│   ├── ios_backend.py    iOS backend (pymobiledevice3 tunnel + DVT)
+│   └── android_backend.py Android backend (bundled adb + `cmd location`)
+├── AnyLoc.spec        PyInstaller build spec (Windows .exe / macOS .app)
+├── requirements.txt   Python dependencies
+├── web/               the UI (index.html, app.js, i18n.js, config.js, icons)
+├── vendor/            bundled adb (vendor/win/adb.exe, vendor/mac/adb)
+└── scripts/           launch & build helpers
     ├── dev.bat / dev.command    dev mode (UI hot-reload, optional real tunnel)
     ├── AnyLoc.command           run-from-source launcher (macOS, no packaging)
     ├── build-mac.sh             build AnyLoc.app + AnyLoc.pkg
@@ -149,9 +154,10 @@ any-loc/
     └── winpreview.py            experimental native-window preview (pywebview)
 ```
 
-`launcher.py`, `backend.py`, `AnyLoc.spec`, and `web/` must stay at the repo root —
-PyInstaller and `import backend` assume they sit together. The `scripts/` helpers
-`cd` back to the root before running.
+The Python source lives in `src/`; `web/`, `vendor/`, and `AnyLoc.spec` stay at the
+repo root. `import backend` works because all `src/*.py` sit together (and the spec
+puts `src/` on `pathex`). The `scripts/` helpers `cd` back to the root and run
+`src/launcher.py`.
 
 ---
 

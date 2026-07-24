@@ -32,4 +32,4 @@ else
 fi
 
 echo "使用 Python: $PY"
-exec "$PY" launcher.py --dev
+exec "$PY" src/launcher.py --dev

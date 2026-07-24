@@ -22,5 +22,5 @@ if %errorlevel%==0 (
   echo   改为【右键 dev.bat ^> 以管理员身份运行】。
 )
 echo.
-python launcher.py --dev
+python src\launcher.py --dev
 pause

@@ -44,12 +44,17 @@ for _stream in ("stdout", "stderr"):
         pass
 
 # ---- import the web server + worker from backend.py -------------------------
-# (backend.py lives next to this file / is bundled by PyInstaller)
+# (backend.py lives next to this file in src/ / is bundled by PyInstaller)
 try:
     import backend
 except Exception:
-    # When frozen, ensure the bundle dir is importable
-    sys.path.insert(0, os.path.dirname(os.path.abspath(sys.executable)))
+    # Ensure the modules' directory is importable:
+    #  * frozen  -> next to the executable (PyInstaller bundle root)
+    #  * source  -> this file's own directory (src/)
+    for _d in (os.path.dirname(os.path.abspath(sys.executable)),
+               os.path.dirname(os.path.abspath(__file__))):
+        if _d not in sys.path:
+            sys.path.insert(0, _d)
     import backend
 
 from http.server import ThreadingHTTPServer

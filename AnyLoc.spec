@@ -136,8 +136,8 @@ for _mod in (
         pass
 
 a = Analysis(
-    ["launcher.py"],
-    pathex=["."],
+    ["src/launcher.py"],
+    pathex=["src"],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

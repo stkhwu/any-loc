@@ -40,11 +40,18 @@ log = logging.getLogger("any-loc")
 DEV_MODE = os.environ.get("ANYLOC_DEV") == "1"
 
 # When frozen by PyInstaller, data files (web/) are unpacked to sys._MEIPASS.
+# From source, the code lives in src/ but web/ sits at the repo root (one level
+# up), so fall back to ../web when there's no web/ next to this file.
 if getattr(sys, "frozen", False):
     _BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    WEB_DIR = os.path.join(_BASE_DIR, "web")
 else:
-    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.join(_BASE_DIR, "web")
+    _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+    _cand = os.path.join(_SRC_DIR, "web")
+    if os.path.isdir(_cand):
+        WEB_DIR = _cand                                    # web/ beside this file
+    else:
+        WEB_DIR = os.path.join(os.path.dirname(_SRC_DIR), "web")  # repo-root web/
 
 
 
