@@ -13,6 +13,7 @@ build/
 dist/
 build2/
 dist2/
+dist_final/
 *.manifest
 
 # Keep the spec (it IS source): AnyLoc.spec is tracked.
