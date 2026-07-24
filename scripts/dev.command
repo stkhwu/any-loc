@@ -23,7 +23,9 @@ echo "============================================================"
 echo
 
 # Prefer a project venv if present, else fall back to python3 on PATH.
-if [ -x ".venv-mac/bin/python" ]; then
+if [ -x "platforms/mac/.venv/bin/python" ]; then
+  PY="platforms/mac/.venv/bin/python"
+elif [ -x ".venv-mac/bin/python" ]; then
   PY=".venv-mac/bin/python"
 elif [ -x ".venv/bin/python" ]; then
   PY=".venv/bin/python"

@@ -7,6 +7,8 @@ __pycache__/
 .venv/
 .venv-mac/
 venv/
+# Per-platform build venvs (new layout)
+platforms/*/.venv/
 
 # ---- PyInstaller build output ----
 # Catch any dist/ dist2/ dist_final/ build/ … the build tools spew out.
@@ -15,6 +17,9 @@ build*/
 dist/
 dist*/
 *.manifest
+# Per-platform build + dist output (new layout)
+platforms/*/dist/
+platforms/*/build/
 
 # Keep the spec (it IS source): AnyLoc.spec is tracked.
 

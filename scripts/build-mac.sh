@@ -2,16 +2,16 @@
 # =============================================================================
 #  build-mac.sh — 在 macOS 上把 AnyLoc 打包成 .app 和 .pkg
 # =============================================================================
-#  产物：
-#    dist/AnyLoc.app          —— 可直接拖进「应用程序」双击运行
-#    dist/AnyLoc-1.1.0.pkg    —— 安装包，双击后自动装进 /Applications
+#  产物（都输出到 platforms/mac/dist/）：
+#    platforms/mac/dist/AnyLoc.app          —— 拖进「应用程序」双击运行
+#    platforms/mac/dist/AnyLoc-1.1.0.pkg    —— 安装包，双击装进 /Applications
 #
 #  用法：
 #    ./build-mac.sh              # 正式版（带 root 提权流程）
 #    ./build-mac.sh test         # 测试版（AnyLocTest.app，可 --selftest 验证）
 #
 #  依赖：Python 3.10+，并已安装 pymobiledevice3 与 pyinstaller。
-#  脚本会优先使用项目里的 .venv-mac / .venv 虚拟环境。
+#  脚本会优先使用 platforms/mac/.venv 虚拟环境（再回退到 .venv-mac / .venv）。
 # =============================================================================
 set -euo pipefail
 # this script lives in scripts/, so cd up to the project root first
@@ -19,6 +19,11 @@ cd "$(dirname "$0")/.."
 
 VARIANT="${1:-final}"
 VERSION="1.1.0"
+
+# All Mac build artifacts live under platforms/mac/ (venv, work files, dist).
+MAC_DIR="platforms/mac"
+DIST_DIR="$MAC_DIR/dist"
+WORK_DIR="$MAC_DIR/build"
 
 if [ "$VARIANT" = "test" ]; then
   APP_NAME="AnyLocTest"
@@ -29,7 +34,9 @@ else
 fi
 
 # ---- pick a Python interpreter ---------------------------------------------
-if [ -x ".venv-mac/bin/python" ]; then
+if [ -x "$MAC_DIR/.venv/bin/python" ]; then
+  PY="$MAC_DIR/.venv/bin/python"
+elif [ -x ".venv-mac/bin/python" ]; then
   PY=".venv-mac/bin/python"
 elif [ -x ".venv/bin/python" ]; then
   PY=".venv/bin/python"
@@ -44,10 +51,12 @@ if ! "$PY" -c "import PyInstaller" 2>/dev/null; then
 fi
 
 # ---- 1) build the .app with PyInstaller ------------------------------------
-echo "==> [1/3] PyInstaller 打包 ($VARIANT) ..."
-ANYLOC_VARIANT="$VARIANT" "$PY" -m PyInstaller --clean --noconfirm AnyLoc.spec
+echo "==> [1/3] PyInstaller 打包 ($VARIANT) → $DIST_DIR ..."
+ANYLOC_VARIANT="$VARIANT" "$PY" -m PyInstaller --clean --noconfirm \
+  --distpath "$DIST_DIR" --workpath "$WORK_DIR" \
+  AnyLoc.spec
 
-APP_PATH="dist/${APP_NAME}.app"
+APP_PATH="$DIST_DIR/${APP_NAME}.app"
 if [ ! -d "$APP_PATH" ]; then
   echo "!! 打包失败：找不到 $APP_PATH"
   exit 1
@@ -91,7 +100,7 @@ pkgbuild \
   --version "$VERSION" \
   "$COMPONENT_PKG"
 
-OUT_PKG="dist/${APP_NAME}-${VERSION}.pkg"
+OUT_PKG="$DIST_DIR/${APP_NAME}-${VERSION}.pkg"
 # productbuild wraps the component into a friendlier distribution installer.
 productbuild \
   --package "$COMPONENT_PKG" \
