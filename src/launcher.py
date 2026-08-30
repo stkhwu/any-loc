@@ -9,10 +9,18 @@ Double-click behaviour:
        * macOS   -> opens Terminal and runs itself under `sudo` (inline password
                     prompt); if already in a terminal, just re-execs via sudo.
   2. Start the web UI server + device worker on a background thread.
-  3. Open the browser.
-  4. Run pymobiledevice3's tunneld in the MAIN thread (it blocks on uvicorn.run).
+  3. Start pymobiledevice3's tunneld on a background daemon thread.
+  4. Give the MAIN thread to the app window (pywebview / Edge WebView2).
 
-One window (which you can minimize), one elevation prompt. No batch/shell files.
+One window, one elevation prompt. No batch/shell files.
+
+THREAD LAYOUT — the two constraints that decide everything here:
+  * pywebview MUST own the main thread (webview.start() raises off-main-thread),
+    so the UI is last and everything else is a daemon thread.
+  * tunneld is happy on a background thread (uvicorn merely skips installing
+    signal handlers when it isn't on the main thread).
+That is the opposite of the old console build, where tunneld blocked main and
+there was no window at all.
 """
 import logging
 import os
@@ -34,28 +42,37 @@ IS_MACOS = sys.platform == "darwin"
 if IS_WINDOWS:
     import ctypes
 
-# The bundled console defaults to the legacy code page (cp1252 on many Windows
-# installs), which crashes on Chinese status/log text. Force UTF-8 on the
-# standard streams before anything prints.
-for _stream in ("stdout", "stderr"):
-    try:
-        getattr(sys, _stream).reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+# THIS MUST STAY THE FIRST THING WE RUN, and it must come BEFORE `import backend`
+# (which drags in pymobiledevice3 → uvicorn).
+#
+# In the windowed build (console=False) sys.stdout/stderr/stdin are all None.
+# uvicorn's default log config builds a ColourizedFormatter that calls
+# sys.stdout.isatty() at *configuration* time — on None that raises
+# AttributeError, which dictConfig re-raises as
+# ValueError("Unable to configure formatter default"), and the app dies before
+# showing anything. install_null_streams() puts back harmless write-to-nowhere
+# stream objects so any library that pokes at the streams simply works.
+# (Belt and braces: we also pass log_config=None to uvicorn.Config — see
+# start_tunneld(). Both are needed; neither alone is sufficient.)
+# It also handles the old job this block used to do: forcing UTF-8 on real
+# streams, since the legacy console code page (cp1252) chokes on our Chinese
+# status text.
+#
+# Make our own directory importable FIRST (normally sys.path[0] already covers
+# it, but not when this module is imported rather than run):
+#   * frozen  -> next to the executable (PyInstaller bundle root)
+#   * source  -> this file's own directory (src/)
+for _d in (os.path.dirname(os.path.abspath(sys.executable)),
+           os.path.dirname(os.path.abspath(__file__))):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+
+import applog
+applog.install_null_streams()
 
 # ---- import the web server + worker from backend.py -------------------------
 # (backend.py lives next to this file in src/ / is bundled by PyInstaller)
-try:
-    import backend
-except Exception:
-    # Ensure the modules' directory is importable:
-    #  * frozen  -> next to the executable (PyInstaller bundle root)
-    #  * source  -> this file's own directory (src/)
-    for _d in (os.path.dirname(os.path.abspath(sys.executable)),
-               os.path.dirname(os.path.abspath(__file__))):
-        if _d not in sys.path:
-            sys.path.insert(0, _d)
-    import backend
+import backend
 
 from http.server import ThreadingHTTPServer
 
@@ -168,13 +185,24 @@ def _relaunch_macos_sudo() -> None:
     """
     Get root on macOS.
 
-    Two situations:
+    Three situations, in order of preference:
+
       * Launched from a Terminal (there's a TTY) -> just re-exec via `sudo`;
         the password prompt appears right here in the same window.
-      * Double-clicked in Finder (the .app has NO terminal) -> open Terminal.app
-        and run ourselves under `sudo` there, so the user gets a visible window
-        with an inline password prompt and the live log — the macOS analog of
-        the Windows console window you keep open while spoofing.
+
+      * Double-clicked in Finder -> ask for the password with the NATIVE macOS
+        authentication dialog (`osascript ... with administrator privileges`),
+        which is the Mac counterpart of the Windows UAC prompt: a familiar system
+        sheet, no Terminal window to keep open and no window the user can close
+        by accident. Requires NSAppleEventsUsageDescription in the bundle's
+        Info.plist (see AnyLoc.spec) or macOS denies the Apple Event outright.
+
+      * If that fails -> fall back to the old Terminal.app path, which still
+        works and at least shows the live log.
+
+    NOTE: with the userspace tunnel (pymobiledevice3 10+) this whole function is
+    usually never reached on macOS — see run_ios_userspace(). It remains the path
+    for iOS 17.0-17.3, which genuinely needs the privileged kernel tunnel.
     """
     argv = _elevation_argv()
 
@@ -187,10 +215,53 @@ def _relaunch_macos_sudo() -> None:
             sys.exit(1)
         return
 
-    # No terminal (Finder double-click): open Terminal.app running `sudo <us>`.
     cmd = " ".join(shlex.quote(a) for a in argv)
+
+    # --- preferred: the native macOS password sheet --------------------------
+    # `do shell script ... with administrator privileges` runs the command as
+    # root after macOS collects the password itself. The command is detached
+    # (nohup + &) so osascript returns immediately instead of blocking for the
+    # entire life of the app.
+    #
+    # SUDO_USER/SUDO_HOME are exported BY HAND because this path is not `sudo`:
+    # osascript hands the command to root with no record of who asked, so
+    # everything that resolves "the real user's home" (the log dir, the WebView
+    # profile, the single-instance lockfile) would silently fall back to
+    # /var/root. That would hide the log, reset the profile, and — worst —
+    # give the elevated instance a DIFFERENT lockfile from the normal one, so
+    # the single-instance guard would stop guarding. `sudo` sets these itself;
+    # here we must.
+    _user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+    _home = os.path.expanduser("~")
+    prelude = ""
+    if _user and _user != "root":
+        prelude = (f"export SUDO_USER={shlex.quote(_user)} "
+                   f"SUDO_HOME={shlex.quote(_home)}; ")
+    detached = f"{prelude}nohup {cmd} >/dev/null 2>&1 &"
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'do shell script {json_str(detached)} with administrator privileges'],
+            check=True, capture_output=True, timeout=300,
+        )
+        sys.exit(0)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", "replace")
+        # -128 is "User canceled" — they clicked Cancel on the password sheet.
+        # That is a deliberate choice, not a failure to report as a crash.
+        if "-128" in err or "User canceled" in err:
+            log = logging.getLogger("any-loc")
+            log.info("User cancelled the authentication prompt.")
+            sys.exit(0)
+        logging.getLogger("any-loc").info(
+            "Native auth prompt failed (%s); falling back to Terminal.", err.strip())
+    except Exception as e:
+        logging.getLogger("any-loc").info(
+            "Native auth prompt unavailable (%s); falling back to Terminal.", e)
+
+    # --- fallback: open Terminal.app running `sudo <us>` ---------------------
     # `exec sudo ...` so the tunnel process replaces the shell (closing the
-    # Terminal window then cleanly stops AnyLoc — mirrors the Windows UX).
+    # Terminal window then cleanly stops AnyLoc).
     shell_line = f"clear; echo '--- AnyLoc (macOS) ---'; exec sudo {cmd}"
     osa = (
         'tell application "Terminal"\n'
@@ -247,6 +318,563 @@ def open_browser(url: str) -> None:
         webbrowser.open(url)
     except Exception:
         pass
+
+
+# =============================================================================
+# Single-instance lock (Windows)
+# =============================================================================
+# The old guard was "the web server failed to bind port 8765, so we must already
+# be running". That was never true: ThreadingHTTPServer sets
+# allow_reuse_address=True, so a second process binds the same LIVE port quite
+# happily and you end up with two AnyLocs fighting over one phone. A named
+# kernel mutex is the real thing — and the kernel releases it even if we are
+# hard-killed, so a crash cannot leave a stale lock behind.
+_MUTEX_NAME = "Local\\AnyLoc.SingleInstance.v1"
+_ERROR_ALREADY_EXISTS = 183
+_instance_mutex = None  # module-level: keep the handle alive for the process
+
+
+def _acquire_single_instance_posix() -> bool:
+    """
+    POSIX single-instance guard: hold an exclusive, non-blocking flock().
+
+    Returns True if we got the lock, False if another AnyLoc holds it.
+
+    The lock FILE is never deleted — deleting it would race a second process
+    that already has it open. What matters is the flock itself, which the kernel
+    releases automatically when this process exits (crash included), so there is
+    no stale-lock cleanup to get wrong.
+
+    The fd is stashed in a module-level global on purpose: if it were garbage
+    collected the file would close and the lock would silently vanish.
+
+    Any failure here returns True — the lock is a convenience, and a broken lock
+    mechanism must never be the reason the app refuses to start.
+    """
+    global _instance_mutex
+    try:
+        import fcntl
+
+        # Alongside the app's other per-user state, and writable without root.
+        try:
+            import gui
+            lock_dir = gui._app_data_root()
+        except Exception:
+            lock_dir = os.path.join(os.path.expanduser("~"), ".anyloc")
+        os.makedirs(lock_dir, exist_ok=True)
+        path = os.path.join(lock_dir, "anyloc.lock")
+
+        fd = open(path, "w")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Held by another live AnyLoc.
+            fd.close()
+            return False
+
+        # Record who holds it — purely diagnostic, for reading the file by hand.
+        try:
+            fd.write(f"{os.getpid()}\n")
+            fd.flush()
+        except Exception:
+            pass
+
+        _instance_mutex = fd      # keep alive for the life of the process
+        return True
+    except Exception:
+        return True
+
+
+def _already_running_error() -> None:
+    """
+    Tell the user another AnyLoc holds the lock but shows no window.
+
+    The instructions MUST match the OS: sending a Mac user to "Task Manager" to
+    kill "AnyLoc.exe" names a program and an application that do not exist on
+    their machine. Shared by both the iOS and Android paths so the two can never
+    drift apart.
+    """
+    if IS_WINDOWS:
+        how = ("请打开任务管理器（Ctrl+Shift+Esc），结束所有 AnyLoc.exe，然后重新打开。\n\n"
+               "An AnyLoc process is still holding the lock but has no window.\n"
+               "Open Task Manager, end any AnyLoc.exe, then start it again.")
+    else:
+        how = ("请打开「活动监视器」（Activity Monitor），搜索 AnyLoc 并强制退出，然后重新打开。\n"
+               "也可以在终端运行：pkill -f AnyLoc\n\n"
+               "An AnyLoc process is still holding the lock but has no window.\n"
+               "Open Activity Monitor, search for AnyLoc and Force Quit it, then "
+               "start it again — or run:  pkill -f AnyLoc")
+    _native_error("AnyLoc 好像还有一个没退干净的进程占着，但它没有窗口。\n" + how,
+                  "AnyLoc")
+
+
+def focus_existing_window() -> bool:
+    """
+    Find an already-running AnyLoc window and bring it to the front.
+
+    Used when the single-instance lock turns out to be held: switching the user
+    to the window they already have is what they actually wanted, and it beats a
+    dialog telling them to go hunt through the taskbar themselves.
+
+    Returns False when no window is found — which is the interesting case. It
+    means the lock is held by a process with no window (wedged, or still tearing
+    down), and the caller should say so rather than pretend all is well.
+    """
+    if IS_MACOS:
+        # Raise the running AnyLoc via System Events. Without this a second
+        # launch always fell through to the "it has no window, Force Quit it"
+        # dialog — alarming advice for the ordinary case of double-clicking the
+        # app twice, where the right answer is simply to show the window that is
+        # already open. Matches on the bundle/process name, and is best-effort:
+        # if System Events is unavailable or denied, we return False and the
+        # caller explains the situation instead.
+        me = os.getpid()
+        script = f'''
+            tell application "System Events"
+                set procs to (every process whose name contains "AnyLoc")
+                repeat with p in procs
+                    if unix id of p is not {me} then
+                        set frontmost of p to true
+                        return "ok"
+                    end if
+                end repeat
+            end tell
+            return "none"
+        '''
+        try:
+            out = subprocess.run(["osascript", "-e", script],
+                                 capture_output=True, text=True, timeout=10)
+            return out.stdout.strip() == "ok"
+        except Exception:
+            return False
+
+    if not IS_WINDOWS:
+        return False
+    try:
+        u = ctypes.windll.user32
+        # restype/argtypes are NOT optional here. ctypes defaults a function's
+        # return type to C `int` (32-bit), but an HWND is a POINTER — on 64-bit
+        # Windows a handle above 2^31 comes back sign-extended/truncated, and
+        # the following calls then operate on a bogus handle (or silently fail).
+        # Declaring the signatures keeps the full 64-bit value intact.
+        u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        u.FindWindowW.restype = ctypes.c_void_p
+        u.IsIconic.argtypes = [ctypes.c_void_p]
+        u.IsIconic.restype = ctypes.c_int
+        u.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.ShowWindow.restype = ctypes.c_int
+        u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        u.SetForegroundWindow.restype = ctypes.c_int
+
+        # Match on the title set by gui.run_window(title="AnyLoc"); the window
+        # class belongs to pywebview's WinForms host and is not ours to rely on.
+        hwnd = u.FindWindowW(None, "AnyLoc")
+        if not hwnd:
+            return False
+        # Restore first — SetForegroundWindow is ignored on a minimized window.
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)      # SW_RESTORE
+        u.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def acquire_single_instance() -> bool:
+    """
+    Take the single-instance lock. True if we got it, False if AnyLoc is already
+    running (caller should tell the user and exit).
+
+    TIMING IS LOAD-BEARING: call this AFTER the elevation relaunch, never before.
+    The non-elevated parent stays alive while ShellExecuteW spawns the elevated
+    child, so a parent holding the mutex would block its own child and the app
+    would refuse to start every single time.
+
+    POSIX/macOS: an exclusive flock() on a lockfile. The claim that "macOS gets
+    one app instance from LaunchServices" does NOT hold for this app: the Finder
+    launch immediately re-execs itself under sudo/Terminal and the original
+    LaunchServices-tracked process exits, so LaunchServices believes AnyLoc quit
+    and will happily start a second one. The .command scripts bypass it entirely.
+    flock has the property we actually need — the KERNEL drops it when the
+    process dies, including on a hard kill, so a crash cannot strand the lock.
+    """
+    global _instance_mutex
+    if not IS_WINDOWS:
+        return _acquire_single_instance_posix()
+    try:
+        # use_last_error=True is not optional: with the plain `ctypes.windll`
+        # handle, ctypes does not preserve the thread's Win32 last-error across
+        # the call, so a separate GetLastError() can read a value clobbered by
+        # ctypes' own internals. This routes it through ctypes' saved copy,
+        # which is the documented way to read it reliably.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        err = ctypes.get_last_error()
+        if handle and err == _ERROR_ALREADY_EXISTS:
+            # Someone else owns the name. Drop our (valid but redundant) handle
+            # so we don't keep the object alive past our own exit.
+            try:
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+            except Exception:
+                pass
+            return False
+        if not handle:
+            # CreateMutexW itself failed — don't let that block the launch.
+            return True
+        # Stash the handle so it lives as long as the process does. The kernel
+        # releases the name when we exit, INCLUDING on a hard kill, so a crash
+        # can never leave a stale lock behind.
+        _instance_mutex = handle
+        return True
+    except Exception:
+        # Never let the lock mechanism itself stop the app from launching.
+        return True
+
+
+# =============================================================================
+# tunneld on a background thread + the ordered shutdown
+# =============================================================================
+def start_tunneld(host: str, port: int):
+    """
+    Run pymobiledevice3's tunneld under a uvicorn server WE own, on a daemon
+    thread. Returns (server, thread).
+
+    Why not TunneldRunner.create()? Two reasons, both fatal here:
+      1. It calls uvicorn.run() with the DEFAULT log config, whose colourised
+         formatter calls sys.stdout.isatty() — and in the windowed build the
+         streams are None. (We install null streams early AND pass
+         log_config=None; belt and braces, because this crash happens before
+         anything is on screen and is thus invisible.)
+      2. No server handle escapes it, so there is no way to stop it. Closing the
+         window could then never stop the tunnel.
+    Its __init__, by contrast, only builds the FastAPI app — it does not serve.
+    So we construct it and serve `_app` ourselves, which gives us
+    `server.should_exit`. Setting that from another thread stops it in ~120ms
+    AND runs the FastAPI lifespan shutdown (TunneldCore.close()) — a real
+    cleanup, unlike the /shutdown route (see shutdown_all).
+    """
+    import uvicorn
+    from pymobiledevice3.tunneld.server import TunneldRunner
+
+    runner = TunneldRunner(host, port)
+
+    # `_app` is private, and pymobiledevice3 has a habit of reshuffling modules
+    # between versions. If it ever disappears, say so loudly instead of dying
+    # with a bare AttributeError in a window with no console.
+    app = getattr(runner, "_app", None)
+    if app is None:
+        raise RuntimeError(
+            "This version of pymobiledevice3 no longer exposes "
+            "TunneldRunner._app, so AnyLoc cannot host the tunnel itself. "
+            "Try:  pip install -U pymobiledevice3"
+        )
+
+    config = uvicorn.Config(
+        app, host=host, port=port,
+        loop="asyncio",
+        log_config=None,   # REQUIRED — see the docstring above.
+    )
+    server = uvicorn.Server(config)
+
+    def _serve():
+        try:
+            server.run()
+        except SystemExit as e:
+            # uvicorn calls sys.exit(1) when the port is already taken. On a
+            # background thread that just kills the thread silently, and with no
+            # console the user would see a window that simply never connects.
+            # Surface it in the log + the UI's device banner instead.
+            _tunneld_failed(
+                f"隧道端口 {host}:{port} 被占用（可能已有 AnyLoc 或 "
+                f"pymobiledevice3 tunneld 在运行）。code={e.code}")
+        except Exception as e:
+            _tunneld_failed(f"隧道启动失败：{type(e).__name__}: {e}")
+
+    t = threading.Thread(target=_serve, daemon=True, name="tunneld")
+    t.start()
+    return server, t
+
+
+def _tunneld_failed(msg: str) -> None:
+    """Report a tunnel start failure to the log AND to the UI status banner."""
+    logging.getLogger("any-loc").error("%s", msg)
+    try:
+        w = backend.Handler.worker
+        if w is not None:
+            # Reuse the devmode channel — it is already the UI's single place
+            # for "what is wrong with the device connection".
+            w.devmode = {"state": "error", "msg": msg}
+    except Exception:
+        pass
+
+
+class _Shutdown:
+    """
+    The one ordered, idempotent teardown. Registered with atexit AND wired to
+    the window's close event, so it runs whichever way the app ends.
+
+    ORDER MATTERS, and step 1 is the whole point:
+      1. worker.shutdown(clear_first=True) — BLOCKS until the phone is actually
+         back on real GPS. This is the fix for the long-standing bug where
+         closing the app left the phone frozen at the fake coordinate: the old
+         shutdown() returned immediately, the interpreter exited, and the daemon
+         worker thread was killed before its async cleanup could run.
+      2. httpd.shutdown() — stop serving the UI (nothing left to serve).
+      3. tunneld server.should_exit = True, then join — the tunnel is what the
+         worker was talking THROUGH, so it must outlive step 1.
+    Every step is logged, so the log file shows exactly how far teardown got if
+    something wedges.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._done = False
+        self.worker = None
+        self.httpd = None
+        self.tunneld_server = None
+        self.tunneld_thread = None
+        self.log = logging.getLogger("any-loc")
+
+    def __call__(self) -> None:
+        # Lock, not just a flag: the window-close handler and atexit can land on
+        # two different threads, and a half-done teardown is worse than none.
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+            self.log.info("Shutting down …")
+
+            # 1) device first — this is what restores real GPS. Blocking.
+            if self.worker is not None:
+                try:
+                    ok = self.worker.shutdown(timeout=8.0, clear_first=True)
+                    self.log.info("  worker stopped (real GPS restored=%s)", ok)
+                except Exception:
+                    self.log.exception("  worker shutdown failed")
+
+            # 2) web UI
+            if self.httpd is not None:
+                try:
+                    self.httpd.shutdown()
+                    self.log.info("  web server stopped")
+                except Exception:
+                    self.log.exception("  web server shutdown failed")
+
+            # 3) tunnel. NEVER via its GET /shutdown route: on Windows that does
+            #    os.kill(pid, SIGINT) == TerminateProcess(handle, 2), i.e. this
+            #    whole process dies instantly with exit code 2 and no cleanup —
+            #    which would skip everything above.
+            if self.tunneld_server is not None:
+                try:
+                    self.tunneld_server.should_exit = True
+                    self.log.info("  tunnel asked to stop")
+                except Exception:
+                    self.log.exception("  could not signal the tunnel")
+            if self.tunneld_thread is not None:
+                try:
+                    self.tunneld_thread.join(timeout=10.0)
+                    self.log.info("  tunnel stopped (alive=%s)",
+                                  self.tunneld_thread.is_alive())
+                except Exception:
+                    self.log.exception("  tunnel join failed")
+
+            self.log.info("Shutdown complete.")
+
+
+def install_signal_handlers(shutdown_all: "_Shutdown") -> None:
+    """
+    Run the ordered teardown when the OS asks us to quit. POSIX only.
+
+    WHY THIS EXISTS — atexit is NOT enough on macOS.
+    `atexit` handlers run on a normal interpreter exit, but a process killed by
+    a SIGNAL never reaches them. Verified: a process sent SIGHUP dies with
+    atexit skipped entirely.
+
+    That is not a corner case here, it is the DOCUMENTED way to quit on macOS.
+    Closing the Terminal window (README: "To stop: close that Terminal window")
+    sends SIGHUP to the foreground process group. Without this, the teardown —
+    including `worker.shutdown(clear_first=True)`, the step that puts the phone
+    back on its REAL GPS — is skipped, and the phone stays frozen at the fake
+    coordinate. That was the single most user-visible macOS bug.
+
+      SIGHUP  — Terminal window closed / session hung up  (the important one)
+      SIGTERM — `kill`, Activity Monitor "Quit", logout/shutdown
+      SIGINT  — Ctrl+C in a terminal run
+
+    Windows has no meaningful SIGHUP and closes via the window's `closing`
+    event, so this is a no-op there and the Windows path is untouched.
+
+    Handlers must be installed from the MAIN thread (Python raises ValueError
+    otherwise), which is why this is called from main() before the window takes
+    over the main thread.
+
+    `_Shutdown` is idempotent and lock-guarded, so a signal arriving *during* a
+    window-close teardown is harmless — the second call returns immediately.
+    """
+    if IS_WINDOWS:
+        return
+
+    import signal
+
+    log = logging.getLogger("any-loc")
+
+    # Two mechanisms can deliver the same signal (see the long note below), so
+    # the teardown must be entered exactly once. _Shutdown is itself idempotent;
+    # this guard additionally stops the second caller from racing the os.kill()
+    # re-raise while the first is still restoring the phone.
+    _firing = threading.Lock()
+    _fired = [False]
+
+    def _teardown(signum):
+        with _firing:
+            if _fired[0]:
+                return
+            _fired[0] = True
+        name = signal.Signals(signum).name
+        log.info("Received %s — restoring real GPS before exit …", name)
+        try:
+            shutdown_all()
+        except Exception:
+            log.exception("teardown on %s failed", name)
+        # Re-raise with the DEFAULT disposition so the process dies the way the
+        # sender intended (and reports the right exit status) instead of us
+        # silently swallowing the signal. Teardown has already run by now.
+        try:
+            # Detach the wakeup pipe first: with SIG_DFL about to fire, a stale
+            # fd would only invite a write error on the way out.
+            try:
+                signal.set_wakeup_fd(-1)
+            except Exception:
+                pass
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            # If re-raising fails for any reason, still leave — the caller asked
+            # us to stop and the device is already released.
+            os._exit(0)
+
+    # HOW the signal is caught matters as much as that it is caught. There are
+    # two independent traps here; both were verified experimentally, and the
+    # combination below is the only one that survives all of them.
+    #
+    # TRAP 1 — a Python-level handler runs on the MAIN thread, and only when
+    # that thread next executes Python bytecode. Once the native window opens,
+    # main is parked inside Cocoa's run loop (C code), so the handler is
+    # deferred until something else wakes it — exactly the case this exists to
+    # cover. (Verified: teardown did not run until the window closed by other
+    # means.)
+    #
+    # TRAP 2 — pthread_sigmask() masks only the CALLING thread and is inherited
+    # only by threads created afterwards. The worker and web-server threads
+    # already exist here with the signal unblocked, and a process-directed
+    # signal may be delivered to ANY thread that accepts it. With the default
+    # disposition, one of those threads takes it and the process dies instantly
+    # with no teardown. (Verified: silent death, no handler, no atexit.)
+    # sigwait() alone therefore does NOT work, and neither does SIG_IGN (which
+    # discards the signal before sigwait can dequeue it).
+    #
+    # THE COMBINATION THAT WORKS:
+    #   1. Install a real Python handler. This sets the process-wide
+    #      disposition, so whichever thread accepts the signal no longer dies —
+    #      it just marks it for the main thread. This defuses trap 2.
+    #   2. Point set_wakeup_fd() at a pipe. CPython writes the signal number to
+    #      that fd from inside the C-level handler, on whatever thread took it,
+    #      with no dependency on the main thread running Python. A watcher
+    #      thread blocked on that pipe therefore wakes IMMEDIATELY, which
+    #      defuses trap 1.
+    # The handler and the watcher both call _teardown, which is guarded so only
+    # the first one through does the work.
+    sigs = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+
+    for sig in sigs:
+        try:
+            signal.signal(sig, lambda s, _f: _teardown(s))
+        except (ValueError, OSError, AttributeError) as e:
+            log.debug("Could not install a handler for %s: %s", sig, e)
+
+    try:
+        r_fd, w_fd = os.pipe()
+        os.set_blocking(r_fd, False)
+        os.set_blocking(w_fd, False)
+        # Must be called from the main thread; returns the previous fd (-1).
+        signal.set_wakeup_fd(w_fd)
+
+        def _wakeup_watch():
+            import selectors
+            sel = selectors.DefaultSelector()
+            sel.register(r_fd, selectors.EVENT_READ)
+            while True:
+                if not sel.select(timeout=None):
+                    continue
+                try:
+                    data = os.read(r_fd, 64)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    return
+                # The byte(s) written are the signal number(s).
+                _teardown(data[-1])
+                return
+
+        threading.Thread(target=_wakeup_watch, daemon=True,
+                         name="signal-watch").start()
+    except (ValueError, OSError, AttributeError) as e:
+        # Without the pipe we still have the plain handlers, which cover every
+        # case except "main thread parked in a native run loop".
+        log.debug("set_wakeup_fd unavailable (%s); using plain handlers only.", e)
+
+
+def run_ui_blocking(url: str, shutdown_all: "_Shutdown", log) -> None:
+    """
+    Hand the MAIN thread to the UI and block until the user closes the window.
+
+    pywebview raises WebViewException("pywebview must be run on a main thread")
+    if started anywhere else, so this is always the last thing main() does and
+    everything else in the app is a daemon thread.
+
+    Three tiers, best first:
+      1. native window (Edge WebView2) — the real product,
+      2. a DEDICATED browser window, whose process exiting tells us the user
+         closed it (the same "closed → tear down" signal the native window's
+         close event gives us),
+      3. the plain default browser + an idle loop, when even that fails.
+    `gui` is imported lazily so that --dev / --selftest never need pywebview.
+    """
+    import gui
+
+    if gui.can_use_native_window():
+        log.info("Opening the app window …")
+        if gui.run_window(
+            url,
+            on_close=shutdown_all,
+            title="AnyLoc",
+            # pywebview sizes are PHYSICAL pixels, not CSS pixels — these are
+            # the values that look right on a 150% display.
+            width=1280, height=860, min_size=(940, 640),
+        ):
+            return
+        log.warning("Native window unavailable — falling back to the browser.")
+
+    log.info("Opening in a browser window …")
+    proc = gui.run_browser_fallback(url)
+    if proc is None:
+        # Last resort: the default browser, which we cannot watch for close.
+        open_browser(url)
+        log.info("界面已在默认浏览器打开：%s", url)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    else:
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            pass
+    shutdown_all()
 
 
 # =============================================================================
@@ -332,15 +960,66 @@ def run_dev(log) -> None:
             worker.shutdown(); httpd.shutdown()
 
 
+def _log_file_path() -> str:
+    """
+    Where applog put the log file, asked of logging itself rather than of applog.
+
+    Reading it back off the root logger's handlers means we don't depend on an
+    applog API beyond setup_logging() — and it still works if setup_logging()
+    never ran (then there is no file handler, and we say so).
+    """
+    for h in logging.getLogger().handlers:
+        name = getattr(h, "baseFilename", None)
+        if name:
+            return name
+    return "(no log file)"
+
+
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    for noisy in ("pymobiledevice3", "urllib3", "asyncio", "uvicorn", "uvicorn.error",
-                  "uvicorn.access"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    """
+    Entry point. Wraps _main() so that a crash in the WINDOWED build is visible.
+
+    With console=False there is no console and sys.stdout is None: an unhandled
+    traceback goes precisely nowhere and the app just vanishes with no
+    explanation. So catch everything at the top, log it (the file log survives),
+    and put it in front of the user in a native box along with the log path so
+    they have something to send us.
+    """
+    try:
+        _main()
+    except SystemExit:
+        raise                       # --selftest et al. exit deliberately
+    except KeyboardInterrupt:
+        pass
+    except BaseException as e:
+        try:
+            logging.getLogger("any-loc").exception("Fatal error")
+        except Exception:
+            pass
+        try:
+            path = _log_file_path()
+        except Exception:
+            path = "(unknown)"
+        _native_error(
+            f"AnyLoc 遇到了一个错误，需要退出。\n\n"
+            f"{type(e).__name__}: {e}\n\n"
+            f"详细日志 / full log:\n{path}",
+            "AnyLoc")
+        raise SystemExit(1)
+
+
+def _main() -> None:
+    # In the windowed build there is no console and sys.stdout is None, so
+    # print()/logging output is silently DISCARDED — a file log is the only way
+    # this app is diagnosable at all. setup_logging() gives us that file plus an
+    # in-memory ring that the UI reads back over /api/logs.
+    # console=None means "attach a console handler only if there is a real
+    # console", which keeps --dev/--selftest/CLI output exactly as it was.
+    applog.setup_logging(level=logging.INFO)
+    # NOTE: the chatty third-party loggers (pymobiledevice3, urllib3, asyncio,
+    # uvicorn*) are squelched by setup_logging() itself via applog.NOISY_LOGGERS.
+    # This used to repeat that list inline here; two copies of the same tuple
+    # only ever drift apart, so the single owner is applog.
     log = logging.getLogger("any-loc")
 
     # --dev: developer mode. Fast iteration without packaging.
@@ -387,7 +1066,10 @@ def main() -> None:
         import urllib.request
         ok = True
         try:
-            for path in ("/", "/app.js", "/api/status"):
+            # /api/logs is in here deliberately: it is the ONLY way to see what
+            # the windowed build is doing, so a build where it 500s is broken
+            # even though everything else looks fine.
+            for path in ("/", "/app.js", "/api/status", "/api/logs"):
                 with urllib.request.urlopen(f"http://{WEB_HOST}:{WEB_PORT}{path}", timeout=5) as r:
                     code = r.getcode()
                     print(f"[selftest] GET {path} -> {code}")
@@ -416,7 +1098,28 @@ def main() -> None:
     if use_android:
         return run_android(log)
 
-    # 1) elevate — the tunnel needs Administrator (Windows) / root (macOS).
+    # 1) Decide whether we need elevation AT ALL.
+    #
+    #    Historically the answer was always yes: the tunnel builds a kernel
+    #    `utun` interface, which requires Administrator/root. pymobiledevice3 10
+    #    can instead build the tunnel on a pure-Python userspace network stack,
+    #    which needs NO privileges — so on macOS the common case (iOS 17.4+ over
+    #    USB) now runs with no password prompt at all, and the app stays a normal
+    #    user process. That matters beyond convenience: a root-owned GUI app is
+    #    discouraged on macOS and would push the WebView profile and logs into
+    #    root's home instead of the user's.
+    #
+    #    iOS 17.0-17.3 has no CoreDeviceProxy service and still needs the kernel
+    #    tunnel; IosBackend fails fast in that case (see _userspace_rsd) and the
+    #    UI's error tells the user to relaunch elevated.
+    #
+    #    Windows keeps the original elevated path: it is the verified, shipped
+    #    behavior there, and UAC is a single click rather than a typed password.
+    use_userspace = (not IS_WINDOWS) and userspace_tunnel_supported() and not is_admin()
+    if use_userspace:
+        log.info("Using the in-process userspace tunnel — no root required.")
+        return run_ios_userspace(log)
+
     if not is_admin():
         if IS_WINDOWS:
             log.info("Requesting administrator rights (needed for the tunnel) ...")
@@ -425,12 +1128,28 @@ def main() -> None:
         relaunch_as_admin()
         return
 
+    # 1.5) single-instance lock — AFTER elevation, never before. The
+    #      non-elevated parent is still alive while UAC spawns the elevated
+    #      child, so taking the lock earlier would make us block our own child.
+    if not acquire_single_instance():
+        # Prefer DOING the obvious thing over telling the user to do it.
+        if focus_existing_window():
+            return
+        # No window to switch to: the lock is held by a process that is not
+        # showing a UI (crashed mid-teardown, or still exiting). Tell the user
+        # exactly how to get unstuck instead of leaving them at a dead end.
+        _already_running_error()
+        return
+
     _priv = "administrator" if IS_WINDOWS else "root"
-    print("\n" + "=" * 62)
-    print(f"  AnyLoc  —  running as {_priv}")
-    print("  This one window runs everything. You can MINIMIZE it,")
-    print("  but keep it open while spoofing. Close it to stop.")
-    print("=" * 62 + "\n")
+    # These used to be print()s describing the console window you had to keep
+    # open. There is no console now — this is a real app window — and print()
+    # with sys.stdout=None is silently discarded anyway, so it goes to the log.
+    log.info("=" * 62)
+    log.info("  AnyLoc  —  running as %s", _priv)
+    log.info("  关掉这个窗口就会停止模拟并恢复真实定位。")
+    log.info("  最小化没关系，但模拟期间请不要关闭窗口。")
+    log.info("=" * 62)
 
     # 2) tunnel import sanity
     from pymobiledevice3.remote.module_imports import verify_tunnel_imports
@@ -448,14 +1167,17 @@ def main() -> None:
     try:
         httpd = start_web_server(worker)
     except OSError as e:
+        # NOT "is AnyLoc already running?" — the mutex above answers that, and
+        # this port was never a lock (allow_reuse_address lets a second process
+        # bind it). A failure here is a genuinely occupied/blocked port.
         _native_error(
-            f"Could not start the web UI on {WEB_HOST}:{WEB_PORT}.\n{e}\n\n"
-            "Is AnyLoc already running?", "AnyLoc")
+            f"无法在 {WEB_HOST}:{WEB_PORT} 启动界面服务。\n{e}\n\n"
+            f"Could not start the web UI on {WEB_HOST}:{WEB_PORT}.\n"
+            "另一个程序可能占用了这个端口。", "AnyLoc")
         return
 
     url = f"http://{WEB_HOST}:{WEB_PORT}/"
     log.info("Web UI:  %s", url)
-    threading.Timer(1.2, lambda: open_browser(url)).start()
 
     # 3.5) Continuously watch for a device and set up Developer Mode in the
     #      background. NOT one-shot: a new phone may be plugged in / unlocked /
@@ -464,21 +1186,35 @@ def main() -> None:
     dm = DevModeWatcher(worker)
     dm.start()
 
-    # 4) run tunneld in the MAIN thread (blocks). It powers get_tunneld_devices().
+    # 4) tunnel on a DAEMON THREAD (it used to block the main thread). The main
+    #    thread now belongs to the window — pywebview refuses to start anywhere
+    #    else.
     log.info("Starting tunnel (this is what talks to the iPhone) ...")
-    from pymobiledevice3.tunneld.server import TunneldRunner
-    from pymobiledevice3.tunneld.api import TUNNELD_DEFAULT_ADDRESS
+    shutdown_all = _Shutdown()
+    shutdown_all.worker = worker
+    shutdown_all.httpd = httpd
     try:
-        TunneldRunner.create(TUNNELD_DEFAULT_ADDRESS[0], TUNNELD_DEFAULT_ADDRESS[1])
-    except KeyboardInterrupt:
-        pass
-    finally:
-        log.info("Tunnel stopped. Shutting down.")
-        try:
-            worker.shutdown()
-            httpd.shutdown()
-        except Exception:
-            pass
+        t_host, t_port = __tunneld_addr()
+        shutdown_all.tunneld_server, shutdown_all.tunneld_thread = \
+            start_tunneld(t_host, t_port)
+    except Exception as e:
+        # Don't abort: without a tunnel the UI still loads and can explain
+        # itself, which beats a window that never appears.
+        _tunneld_failed(f"隧道启动失败：{type(e).__name__}: {e}")
+
+    # Belt and braces. The window's close handler calls shutdown_all directly;
+    # atexit covers the paths that don't go through it (a fatal error below, or
+    # anything that unwinds main). It is idempotent, so a double call is free.
+    import atexit
+    atexit.register(shutdown_all)
+
+    # atexit does NOT run when a signal kills us, and on macOS closing the
+    # Terminal window (SIGHUP) is a normal way to quit — without this the phone
+    # would be left on the fake location. See install_signal_handlers().
+    install_signal_handlers(shutdown_all)
+
+    # 5) MAIN THREAD -> the UI. This blocks until the window closes.
+    run_ui_blocking(url, shutdown_all, log)
 
 
 # =============================================================================
@@ -508,20 +1244,91 @@ def detect_android() -> bool:
     return False
 
 
+def run_ios_userspace(log) -> None:
+    """
+    Run AnyLoc against an iPhone with NO elevation, using the in-process
+    userspace tunnel (pymobiledevice3 10+).
+
+    Shaped like run_android(): no elevation prompt and no separate `tunneld`
+    server, because the tunnel lives inside our own process. Everything from the
+    web server down is identical to the elevated path — only how we reach the
+    phone differs.
+
+    If the device turns out to need the kernel tunnel (iOS 17.0-17.3), the
+    backend raises and the UI shows the error; the user can relaunch elevated to
+    get the old path. We deliberately do NOT auto-elevate here: silently
+    demanding a password after starting without one is worse than saying why.
+    """
+    if not acquire_single_instance():
+        if focus_existing_window():
+            return
+        _already_running_error()
+        return
+
+    log.info("=" * 62)
+    log.info("  AnyLoc  —  iOS 模式（免 root / no elevation）")
+    log.info("  关闭窗口就会停止模拟并恢复真实定位。")
+    log.info("=" * 62)
+
+    worker = _ios_worker(userspace=True)
+    worker.start()
+    worker.connect()
+    try:
+        httpd = start_web_server(worker)
+    except OSError as e:
+        _native_error(
+            f"无法在 {WEB_HOST}:{WEB_PORT} 启动界面服务。\n{e}\n\n"
+            f"Could not start the web UI on {WEB_HOST}:{WEB_PORT}.\n"
+            "另一个程序可能占用了这个端口。", "AnyLoc")
+        return
+
+    url = f"http://{WEB_HOST}:{WEB_PORT}/"
+    log.info("Web UI:  %s", url)
+
+    # Same device-setup guidance as the elevated path (plug in / Trust /
+    # Developer Mode); none of it needs privileges.
+    DevModeWatcher(worker).start()
+
+    shutdown_all = _Shutdown()
+    shutdown_all.worker = worker
+    shutdown_all.httpd = httpd
+    # (no tunneld process — the tunnel is inside the worker's own session)
+    import atexit
+    atexit.register(shutdown_all)
+    install_signal_handlers(shutdown_all)
+
+    run_ui_blocking(url, shutdown_all, log)
+
+
 def run_android(log) -> None:
     """Run AnyLoc against an Android device over adb. No elevation, no tunnel.
 
     Mirrors main()'s iOS path minus the parts that only iOS needs: no UAC/sudo,
-    no TunneldRunner. The web server is a daemon thread, so an AdbWatcher loop on
-    the MAIN thread both reports connection status and keeps the process alive.
+    no TunneldRunner. Like the iOS path, the MAIN thread goes to the app window,
+    so the AdbWatcher — which used to block main and keep the process alive — now
+    runs on its own daemon thread.
     """
     from android_backend import AndroidBackend
 
-    print("\n" + "=" * 62)
-    print("  AnyLoc  —  Android mode (adb)")
-    print("  No administrator needed. This one window runs everything;")
-    print("  you can MINIMIZE it, but keep it open while spoofing.")
-    print("=" * 62 + "\n")
+    # Safe to take the lock immediately here: the Android path never elevates,
+    # so there is no parent process waiting on a child that would need it.
+    if not acquire_single_instance():
+        # Prefer DOING the obvious thing over telling the user to do it.
+        if focus_existing_window():
+            return
+        # No window to switch to: the lock is held by a process that is not
+        # showing a UI (crashed mid-teardown, or still exiting). Tell the user
+        # exactly how to get unstuck instead of leaving them at a dead end.
+        _already_running_error()
+        return
+
+    # Console-era copy, retired: this is a real app window, and print() with
+    # sys.stdout=None is silently discarded anyway.
+    log.info("=" * 62)
+    log.info("  AnyLoc  —  Android 模式 (adb)")
+    log.info("  不需要管理员权限。关掉这个窗口就会停止模拟并恢复真实定位。")
+    log.info("  最小化没关系，但模拟期间请不要关闭窗口。")
+    log.info("=" * 62)
 
     worker = backend.DeviceWorker(AndroidBackend())
     worker.start()
@@ -529,29 +1336,35 @@ def run_android(log) -> None:
     try:
         httpd = start_web_server(worker)
     except OSError as e:
+        # The mutex above is the single-instance check; a failure here means the
+        # port is genuinely taken by something else.
         _native_error(
-            f"Could not start the web UI on {WEB_HOST}:{WEB_PORT}.\n{e}\n\n"
-            "Is AnyLoc already running?", "AnyLoc")
+            f"无法在 {WEB_HOST}:{WEB_PORT} 启动界面服务。\n{e}\n\n"
+            f"Could not start the web UI on {WEB_HOST}:{WEB_PORT}.\n"
+            "另一个程序可能占用了这个端口。", "AnyLoc")
         return
 
     url = f"http://{WEB_HOST}:{WEB_PORT}/"
     log.info("Web UI:  %s", url)
-    threading.Timer(1.2, lambda: open_browser(url)).start()
 
-    # Main-thread keep-alive + connection watcher. Reports human-readable status
+    shutdown_all = _Shutdown()
+    shutdown_all.worker = worker
+    shutdown_all.httpd = httpd
+    # (no tunneld on Android — those slots stay None and are skipped)
+    import atexit
+    atexit.register(shutdown_all)
+
+    # Same reason as the iOS path: a signal (Terminal closed / Force Quit) skips
+    # atexit, and the phone's mock providers must still be removed.
+    install_signal_handlers(shutdown_all)
+
+    # Connection watcher, now on its own thread. Reports human-readable status
     # into worker.devmode so the UI can guide the user (plug in / authorize).
     watcher = AdbWatcher(worker)
-    try:
-        watcher.run_blocking()   # blocks until Ctrl-C / window closed
-    except KeyboardInterrupt:
-        pass
-    finally:
-        log.info("Shutting down.")
-        try:
-            worker.shutdown()
-            httpd.shutdown()
-        except Exception:
-            pass
+    threading.Thread(target=watcher.run_blocking, daemon=True,
+                     name="adb-watch").start()
+
+    run_ui_blocking(url, shutdown_all, log)
 
 
 class AdbWatcher:
@@ -739,10 +1552,31 @@ def __tunneld_addr():
     return TUNNELD_DEFAULT_ADDRESS
 
 
-def _ios_worker():
+def _ios_worker(userspace: bool = False):
     """Build a DeviceWorker wired to the iOS (pymobiledevice3) backend."""
     from ios_backend import IosBackend
-    return backend.DeviceWorker(IosBackend(*__tunneld_addr()))
+    return backend.DeviceWorker(IosBackend(*__tunneld_addr(), userspace=userspace))
+
+
+def userspace_tunnel_supported() -> bool:
+    """
+    True if this pymobiledevice3 can build the tunnel with NO root.
+
+    pymobiledevice3 10.x added a pure-Python (PyTCP) userspace network stack as
+    an alternative to the kernel `utun` device. That kernel device was the ONLY
+    reason AnyLoc ever needed Administrator/root, so when this is available we
+    can skip elevation entirely — no UAC prompt, no sudo password.
+
+    Older pymobiledevice3 (9.x, which the Windows build was verified against)
+    has no such module, so this returns False there and everything falls back to
+    the original elevated-tunneld path unchanged.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec(
+            "pymobiledevice3.remote.userspace_tunnel") is not None
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":

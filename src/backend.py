@@ -72,6 +72,13 @@ class DeviceWorker:
         self._want_clear = False
         self._session_task = None
 
+        # Signals that the session has fully finished tearing down. A
+        # threading.Event (not asyncio) because shutdown() is called from
+        # non-loop threads and must BLOCK on it. Starts SET: with no session
+        # running there is nothing to wait for.
+        self._done = threading.Event()
+        self._done.set()
+
         # Public-ish state (plain attribute reads from HTTP threads; GIL-safe enough).
         self.state = "idle"             # idle | connecting | connected | error
         self.error = None
@@ -102,12 +109,25 @@ class DeviceWorker:
             self.state = "connecting"
             self.error = None
             self._stop.clear()
+            # A session is about to exist, so shutdown() must wait for it.
+            # Cleared HERE (on the loop thread, before the task is created)
+            # rather than inside _session(), so there is no window in which
+            # shutdown() could see a stale "already done" and return True for a
+            # session that is still starting up.
+            self._done.clear()
             self._session_task = self.loop.create_task(self._session())
         self.loop.call_soon_threadsafe(_schedule)
 
     def set_location(self, lat: float, lon: float):
         """Store desired coordinate; applied by the mover on the open channel."""
         def _apply():
+            # Once shutdown has been requested, ignore further movement: the UI
+            # streams ~10 POSTs/second while the joystick is held, so one that
+            # was already in flight when the window closed would otherwise land
+            # here and clear _want_clear — cancelling the shutdown clear and
+            # leaving the phone on the fake location.
+            if self._stop.is_set():
+                return
             self.target = (lat, lon)
             self._want_clear = False
             self._dirty.set()
@@ -131,14 +151,53 @@ class DeviceWorker:
             **self.backend.status_extra(),
         }
 
-    def shutdown(self):
+    def shutdown(self, timeout: float = 8.0, clear_first: bool = True) -> bool:
+        """
+        Stop the session and BLOCK until the device has actually been released.
+
+        This used to be fire-and-forget: it only did call_soon_threadsafe() and
+        returned, so the interpreter exited and killed the daemon worker thread
+        before the session's async `finally` ever ran. The result was a phone
+        left frozen at the fake coordinate — Android's test providers were never
+        removed, and iOS does not auto-clear when the DVT channel closes (its
+        close() is a documented no-op). Closing the app therefore did NOT give
+        you your real GPS back.
+
+        So the contract is now: **when this returns True, the phone is back on
+        real GPS.** Callers (the launcher's shutdown_all) depend on that, which
+        is why they must call this FIRST, before anything else is torn down.
+
+        clear_first — ask the session to clear the simulated location on its way
+                      out (leave it True unless you deliberately want the fake
+                      location to persist).
+        timeout      — seconds to wait for the teardown. A real teardown takes
+                       ~1.4-1.7s; the default leaves generous headroom.
+
+        Returns False if the session did not finish in time (the caller should
+        log it and carry on rather than hang forever — a wedged USB channel must
+        not be able to keep the window open).
+        """
+        # Nothing running (or never started): there is nothing to release.
+        if self._done.is_set() or not self._thread.is_alive():
+            return True
+
         def _apply():
+            if clear_first:
+                self._want_clear = True
             self._stop.set()
             self._dirty.set()
+
         try:
             self.loop.call_soon_threadsafe(_apply)
         except Exception:
-            pass
+            # The loop is already gone; nothing left to wait for.
+            return True
+
+        if not self._done.wait(timeout):
+            log.warning("Worker shutdown timed out after %.1fs "
+                        "(device may still be simulating).", timeout)
+            return False
+        return True
 
     # ---- the session (runs on the worker loop) ------------------------------
     async def _device_alive(self) -> bool:
@@ -151,75 +210,33 @@ class DeviceWorker:
     async def _session(self):
         try:
             async with self.backend.session() as sess:
-                self.device = self.backend.device_info()
-                self.state = "connected"
-                self.error = None
-                log.info("Location channel open. Ready to spoof.")
-
-                # If a clear was requested while we were (re)connecting — e.g. the
-                # user hit "Reset real GPS" from an error state, which triggers a
-                # reconnect — honour it right away so the button actually works.
-                if self._want_clear:
-                    self._want_clear = False
-                    try:
-                        await sess.clear()
-                        self.applied = None
-                        log.info("Pending clear applied on connect (real GPS restored).")
-                    except Exception:
-                        log.exception("pending clear failed")
-
-                # Apply an initial target immediately if one is already queued.
-                if self.target is not None:
-                    self._dirty.set()
-
-                while not self._stop.is_set():
-                    # Wait for a new target, but wake up every ~3s to run a health
-                    # check so we notice the device being unplugged in real time.
-                    try:
-                        await asyncio.wait_for(self._dirty.wait(), timeout=3.0)
-                    except asyncio.TimeoutError:
-                        # heartbeat: is the device still reachable?
-                        if not await self._device_alive():
-                            self.state = "idle"
-                            self.error = None
-                            self.device = {}
-                            log.info("Device disconnected. Back to idle.")
-                            return
-                        continue
-                    self._dirty.clear()
-                    if self._stop.is_set():
-                        break
-
+                try:
+                    await self._run_session(sess)
+                finally:
+                    # THE LAST-CHANCE CLEAR — this is the guarantee behind
+                    # "closing the app restores your real GPS".
+                    #
+                    # _run_session() has SEVERAL exits: the `while` header
+                    # re-check, a `break` on error, and two `return`s for a
+                    # vanished device. Only one of them used to do the clear, so
+                    # stopping the worker while the loop happened to be inside a
+                    # health probe or an apply() skipped it entirely — and
+                    # shutdown() still returned True, so the app logged "real GPS
+                    # restored=True" with the phone still frozen at the fake
+                    # coordinate. (Reproduced deterministically with a slow
+                    # is_alive().)
+                    #
+                    # Doing it HERE, inside the `async with`, means every exit
+                    # path runs it while the channel is still open — which iOS
+                    # requires, since its DVT close() is a documented no-op.
                     if self._want_clear:
                         self._want_clear = False
                         try:
                             await sess.clear()
                             self.applied = None
-                            log.info("Location simulation cleared (real GPS restored).")
-                        except Exception as e:
-                            self.state = "error"
-                            self.error = f"clear failed: {e}"
-                            log.exception("clear failed")
-                            break
-                        continue
-
-                    target = self.target
-                    if target is None:
-                        continue
-                    try:
-                        await sess.apply(float(target[0]), float(target[1]))
-                        self.applied = target
-                    except Exception as e:
-                        # A failed apply almost always means the device went away.
-                        if not await self._device_alive():
-                            self.state = "idle"; self.error = None; self.device = {}
-                            log.info("Device disconnected during set. Back to idle.")
-                            return
-                        self.state = "error"
-                        self.error = "set failed"
-                        log.exception("set failed")
-                        break
-
+                            log.info("Cleared on shutdown (real GPS restored).")
+                        except Exception:
+                            log.exception("clear on shutdown failed")
         except Exception as e:
             self.state = "error"
             self.error = str(e)
@@ -229,11 +246,149 @@ class DeviceWorker:
                 self.state = "idle"
             self.device = {}
             log.info("Session ended (state=%s).", self.state)
+            # Release shutdown()'s waiter LAST: once this is set, the caller is
+            # entitled to assume the device has been released and may start
+            # tearing down the tunnel the session was talking through.
+            self._done.set()
+
+    async def _run_session(self, sess):
+        """The mover loop. Runs inside _session()'s open channel."""
+        self.device = self.backend.device_info()
+        self.state = "connected"
+        self.error = None
+        log.info("Location channel open. Ready to spoof.")
+
+        # If a clear was requested while we were (re)connecting — e.g. the
+        # user hit "Reset real GPS" from an error state, which triggers a
+        # reconnect — honour it right away so the button actually works.
+        if self._want_clear:
+            self._want_clear = False
+            try:
+                await sess.clear()
+                self.applied = None
+                log.info("Pending clear applied on connect (real GPS restored).")
+            except Exception:
+                log.exception("pending clear failed")
+
+        # Apply an initial target immediately if one is already queued.
+        if self.target is not None:
+            self._dirty.set()
+
+        while not self._stop.is_set():
+            # Wait for a new target, but wake up every ~3s to run a health
+            # check so we notice the device being unplugged in real time.
+            try:
+                await asyncio.wait_for(self._dirty.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                # heartbeat: is the device still reachable?
+                if not await self._device_alive():
+                    self.state = "idle"
+                    self.error = None
+                    self.device = {}
+                    log.info("Device disconnected. Back to idle.")
+                    return
+                continue
+            self._dirty.clear()
+            if self._stop.is_set():
+                # The clear happens in _session()'s finally, which covers this
+                # exit and every other one.
+                break
+
+            if self._want_clear:
+                self._want_clear = False
+                try:
+                    await sess.clear()
+                    self.applied = None
+                    log.info("Location simulation cleared (real GPS restored).")
+                except Exception as e:
+                    self.state = "error"
+                    self.error = f"clear failed: {e}"
+                    log.exception("clear failed")
+                    break
+                continue
+
+            target = self.target
+            if target is None:
+                continue
+            try:
+                await sess.apply(float(target[0]), float(target[1]))
+                self.applied = target
+            except Exception as e:
+                # A failed apply almost always means the device went away.
+                if not await self._device_alive():
+                    self.state = "idle"; self.error = None; self.device = {}
+                    log.info("Device disconnected during set. Back to idle.")
+                    return
+                self.state = "error"
+                self.error = "set failed"
+                log.exception("set failed")
+                break
 
 
 # =============================================================================
 # HTTP layer
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# Approximate "where is this computer" via IP geolocation.
+#
+# Used ONLY to pick the map's opening view. It is never sent to the device: a
+# coarse IP guess is a reasonable place to start panning from, and a terrible
+# thing to silently spoof your phone to.
+#
+# Cached for the process lifetime so opening the app costs at most one lookup,
+# and the whole thing is best-effort -- any failure just leaves the caller on
+# its built-in default.
+# -----------------------------------------------------------------------------
+_IPLOC_CACHE = None
+_IPLOC_LOCK = threading.Lock()
+
+
+def _lookup_ip_location() -> dict:
+    """Best-effort coarse location for this machine. {} when unavailable."""
+    global _IPLOC_CACHE
+    with _IPLOC_LOCK:
+        if _IPLOC_CACHE is not None:
+            return _IPLOC_CACHE
+
+    import urllib.request
+    result = {}
+    # Two providers, tried in order: both are key-less and return lat/lon.
+    # ipwho.is is materially more precise (city-level) than geojs, which has
+    # been observed to answer with a point ~600km from the real one -- so it
+    # goes first and geojs is only the fallback.
+    providers = (
+        ("https://ipwho.is/", lambda d: (d.get("latitude"), d.get("longitude"),
+                                         d.get("city") or d.get("region") or "")),
+        ("https://get.geojs.io/v1/ip/geo.json",
+         lambda d: (d.get("latitude"), d.get("longitude"), d.get("city") or "")),
+    )
+    for url, pick in providers:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AnyLoc"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            lat, lon, city = pick(data)
+            lat, lon = float(lat), float(lon)
+            # Reject a nonsense answer rather than pointing the map at null island.
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                continue
+            if lat == 0 and lon == 0:
+                continue
+            result = {"lat": lat, "lon": lon, "city": city or ""}
+            log.info("Startup map view from IP geolocation: %s (%.4f, %.4f)",
+                     city or "?", lat, lon)
+            break
+        except Exception as e:
+            log.debug("ip geolocation via %s failed: %s: %s", url, type(e).__name__, e)
+
+    if not result:
+        log.info("IP geolocation unavailable; map opens on its default view.")
+    with _IPLOC_LOCK:
+        _IPLOC_CACHE = result
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     worker: DeviceWorker = None  # injected
 
@@ -299,6 +454,42 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _logs_payload(self):
+        """
+        Serve the in-memory log ring for the UI's log panel.
+
+        This is the ONLY way to see what the app is doing in the windowed
+        (console=False) build: there is no console, sys.stdout is None, and
+        print()/logging output is silently discarded. So the ring is not a
+        nicety — it is the diagnostic channel.
+
+        `after` is a cursor, not an index: pass back the `next` from the previous
+        response and you get only what has appeared since. Everything is parsed
+        defensively (garbage query strings must not 500 the log viewer — that is
+        precisely when you need it).
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        qs = parse_qs(urlsplit(self.path).query)
+
+        def _int(name, default, lo, hi):
+            try:
+                v = int(qs.get(name, [default])[0])
+            except (TypeError, ValueError, IndexError):
+                return default
+            return max(lo, min(hi, v))
+
+        after = _int("after", 0, 0, 2 ** 62)
+        limit = _int("limit", 200, 1, 2000)
+
+        try:
+            import applog
+            entries, nxt = applog.get_ring().snapshot(after=after, limit=limit)
+        except Exception as e:
+            # A broken log viewer must never take the app down with it.
+            return {"entries": [], "next": after, "error": f"{type(e).__name__}: {e}"}
+        return {"entries": list(entries), "next": nxt}
+
     # ---- routes ----
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -306,6 +497,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file("index.html")
         if path == "/api/status":
             return self._send_json(self.worker.status())
+        if path == "/api/logs":
+            return self._send_json(self._logs_payload())
+        if path == "/api/iploc":
+            # Coarse startup map view only -- never applied to the device.
+            return self._send_json(_lookup_ip_location())
         if path == "/api/livereload":
             # Dev-only: report the newest mtime across web/ so the page can
             # auto-refresh when a file changes. Cheap to poll.

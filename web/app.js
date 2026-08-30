@@ -14,6 +14,9 @@ const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 6) => Number(n).toFixed(d);
 const clampLon = (x) => (x > 180 ? x - 360 : x < -180 ? x + 360 : x);
 const hasCJK = (s) => /[　-鿿가-힯＀-￯]/.test(s);
+// UI languages whose speakers read CJK scripts natively -- used to keep a CJK
+// place name in its own script instead of transliterating it.
+const CJK_LANGS = new Set(["zh", "ja", "ko"]);
 
 // ============================================================================
 // Theme — light / dark, follows system by default, manual override persisted
@@ -49,14 +52,60 @@ function setupThemeToggle() {
 applyTheme(); // apply ASAP to avoid flash
 
 // ============================================================================
+// HELP — getting-started guide
+// ============================================================================
+// A modal rather than an inline card: the steps are long enough to push the
+// whole panel around, and the user reads them once. Content is plain markup in
+// index.html carrying data-i18n, so applyI18n() translates it like everything
+// else and no strings live in here.
+function setupHelp() {
+  const ov = document.getElementById("helpOv");
+  if (!ov) return;                       // markup missing -> feature just absent
+  const open = () => { ov.classList.add("show"); document.getElementById("helpClose").focus(); };
+  const close = () => ov.classList.remove("show");
+
+  const btn = document.getElementById("helpBtn");
+  if (btn) btn.addEventListener("click", open);
+  document.getElementById("helpClose").addEventListener("click", close);
+
+  // Click the backdrop to dismiss, but not a click inside the dialog: the
+  // listener is on the overlay, so compare against the target itself.
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+
+  // Escape closes. Bound on document because focus may sit anywhere inside.
+  // Guarded on .show so this does not swallow Escape for the favorite-name
+  // editor (app.js beginFavEdit), which has its own Escape-cancels handling.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && ov.classList.contains("show")) { close(); e.stopPropagation(); }
+  });
+
+  // Platform tabs. Plain show/hide — both sections are already in the DOM and
+  // translated, so switching costs nothing and survives a language change.
+  const tabs = [
+    [document.getElementById("helpTabIos"), document.getElementById("helpSecIos")],
+    [document.getElementById("helpTabAnd"), document.getElementById("helpSecAnd")],
+  ];
+  tabs.forEach(([tab]) => tab && tab.addEventListener("click", () => {
+    tabs.forEach(([t, sec]) => {
+      const on = t === tab;
+      t.classList.toggle("on", on);
+      sec.classList.toggle("on", on);
+    });
+  }));
+}
+
+// ============================================================================
 // i18n — 多语言
 // ============================================================================
 const I18N = window.I18N || { zh: {} };
 let LANG = localStorage.getItem("anyloc_lang");
 if (!LANG || !I18N[LANG]) {
-  // auto-detect from browser, default zh
+  // Auto-detect from the browser, default zh. Matched against whatever I18N
+  // actually ships, so adding a language to i18n.js is enough to make it
+  // auto-detect -- there is no second list here to forget to update.
   const nav = (navigator.language || "zh").toLowerCase();
-  LANG = nav.startsWith("ja") ? "ja" : nav.startsWith("en") ? "en" : "zh";
+  const base = nav.split("-")[0];
+  LANG = Object.keys(I18N).find((c) => c === base) || "zh";
 }
 function t(key) {
   const d = I18N[LANG] || {};
@@ -149,44 +198,61 @@ function gcj02ToWgs84(lng, lat) {
 }
 
 // ============================================================================
+// EXTERNAL LINKS — never navigate the top-level frame
+// ============================================================================
+// This window has no address bar and no Back button, so ANY top-level
+// navigation strands the user with no way home. Leaflet's attribution control
+// ships an <a href="https://leafletjs.com"> with no target, and pywebview only
+// intercepts window.open / target=_blank. A delegated CAPTURE-phase listener
+// beats Leaflet's own handlers and also covers any anchor added later (popups,
+// tile-layer attributions), which a one-time patch of the existing DOM would
+// miss. The attribution TEXT stays visible — that is a licensing obligation;
+// only the navigation is cancelled.
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a[href]");
+  if (!a) return;
+  if (/^https?:/i.test(a.getAttribute("href") || "")) {
+    e.preventDefault();
+  }
+}, true);
+
+// ============================================================================
 // MAP + LAYERS
 // ============================================================================
+// Fallback opening view (Apple Park) for when IP geolocation is unavailable --
+// offline, blocked, or still in flight. See locateOnStartup() at the bottom.
 const START = [37.3349, -122.0090];
-const map = L.map("map", {
-  zoomControl: false, worldCopyJump: true,   // custom zoom buttons (see below)
-  rotate: true, touchRotate: true, bearing: 0,
-  rotateControl: false,   // we render our own styled compass
-}).setView(START, 13);
 
-// ---- custom zoom +/- buttons (fully self-styled, no Leaflet divider quirks) ----
-const ZoomControl = L.Control.extend({
-  options: { position: "topleft" },
-  onAdd() {
-    const el = L.DomUtil.create("div", "zoom-ctl");
-    el.innerHTML =
-      '<button class="zoom-btn" id="zoomIn" title="放大" aria-label="zoom in">' +
-      '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>' +
-      '<button class="zoom-btn" id="zoomOut" title="缩小" aria-label="zoom out">' +
-      '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg></button>';
-    L.DomEvent.disableClickPropagation(el);
-    el.querySelector("#zoomIn").addEventListener("click", (e) => { e.preventDefault(); map.zoomIn(); });
-    el.querySelector("#zoomOut").addEventListener("click", (e) => { e.preventDefault(); map.zoomOut(); });
-    return el;
-  },
-});
-map.addControl(new ZoomControl());
+// True once the user has done anything positional. IP geolocation is slow
+// (a network round trip), so it can land AFTER the user has already clicked
+// the map -- and yanking the view away at that point would be worse than
+// opening on the default. Any real interaction cancels it.
+let userMovedMap = false;
 
-// tile layers keyed by a stable id; display names come from i18n
-const tileLayers = {
-  standard: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    { maxZoom: 19, attribution: "© OpenStreetMap" }),
-  dark: L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    { maxZoom: 20, subdomains: "abcd", attribution: "© OpenStreetMap © CARTO" }),
-  light: L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-    { maxZoom: 20, subdomains: "abcd", attribution: "© OpenStreetMap © CARTO" }),
-  satellite: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    { maxZoom: 19, attribution: "© Esri" }),
-};
+// Leaflet is vendored locally, but a missing/corrupt file would otherwise throw
+// here and abort the whole script — which used to kill the INIT block below and
+// leave a half-rendered panel with an empty language menu and no explanation.
+// INIT now runs FIRST (see the bottom of this file), and the map bootstrap is
+// wrapped so a failure degrades to a translated banner with everything else
+// still working.
+let map = null;
+function mapAlive() { return map !== null; }
+function showMapFailure() {
+  const el = $("mapFail");
+  if (el) el.classList.add("show");
+  const mapDiv = $("map");
+  if (mapDiv) mapDiv.style.display = "none";
+}
+
+// Everything below that the rest of the app reaches into lives at module scope
+// and is ASSIGNED by bootMap(); only the statements that evaluate `L.*` right
+// away (the Control subclasses, the layer/marker construction) sit inside it.
+let marker = null;
+let tileLayers = null;
+let layerSwitcherEl = null;
+let compassEl = null;
+let currentLayer = "standard";
+
 const LAYER_I18N = { standard: "layer.standard", dark: "layer.dark", light: "layer.light", satellite: "layer.satellite" };
 // a static thumbnail per layer (a single tile of a recognizable area)
 const LAYER_THUMB = {
@@ -195,33 +261,17 @@ const LAYER_THUMB = {
   light: "https://a.basemaps.cartocdn.com/light_all/6/51/24.png",
   satellite: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/6/24/51",
 };
-let currentLayer = "standard";
-tileLayers.standard.addTo(map);
 
 function selectLayer(id) {
-  if (id === currentLayer) return;
+  if (!map || id === currentLayer) return;
   map.removeLayer(tileLayers[currentLayer]);
   tileLayers[id].addTo(map);
   currentLayer = id;
   renderLayerSwitcher();
 }
-
-// Google-Maps-style thumbnail layer switcher (custom Leaflet control)
-let layerSwitcherEl = null;
-const LayerSwitcher = L.Control.extend({
-  options: { position: "bottomleft" },
-  onAdd() {
-    const el = L.DomUtil.create("div", "gm-layers");
-    L.DomEvent.disableClickPropagation(el);
-    L.DomEvent.disableScrollPropagation(el);
-    layerSwitcherEl = el;
-    renderLayerSwitcher();
-    return el;
-  },
-});
 function renderLayerSwitcher() {
   const el = layerSwitcherEl;
-  if (!el) return;
+  if (!el) return;   // no map booted -> no switcher to relabel
   const ids = Object.keys(tileLayers);
   el.innerHTML =
     `<button class="gm-layers-chip" title="${t("layer.switch") || ""}">
@@ -247,79 +297,138 @@ function renderLayerSwitcher() {
   const chip = el.querySelector(".gm-layers-chip");
   chip.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); el.classList.toggle("open"); });
 }
+function relabelLayers() { renderLayerSwitcher(); }
 function collapseLayers() { if (layerSwitcherEl) layerSwitcherEl.classList.remove("open"); }
 document.addEventListener("click", (e) => { if (layerSwitcherEl && !layerSwitcherEl.contains(e.target)) collapseLayers(); });
-map.addControl(new LayerSwitcher());
-function relabelLayers() { renderLayerSwitcher(); }
-
-// ---- Recenter button: fly back to the current spoofed marker ----
-const RecenterControl = L.Control.extend({
-  options: { position: "bottomleft" },
-  onAdd() {
-    const el = L.DomUtil.create("div", "map-recenter");
-    el.title = "回到当前位置";
-    // navigation-style triangle/arrow icon
-    el.innerHTML =
-      '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"><path d="M12 3l7.5 16.5a.6.6 0 0 1-.8.8L12 17l-6.7 3.3a.6.6 0 0 1-.8-.8z"/></svg>';
-    L.DomEvent.disableClickPropagation(el);
-    el.addEventListener("click", (e) => {
-      e.preventDefault();
-      map.setView([pos.lat, pos.lon], Math.max(map.getZoom(), 16), { animate: true });
-    });
-    return el;
-  },
-});
-map.addControl(new RecenterControl());
-
-// ---- Compass: shows bearing, drag-free reset-to-north; map is rotatable ----
-let compassEl = null;
-const CompassControl = L.Control.extend({
-  options: { position: "topleft" },
-  onAdd() {
-    const el = L.DomUtil.create("div", "map-compass");
-    el.title = "指南针（点击回正北，按住拖动旋转地图）";
-    el.innerHTML =
-      '<svg viewBox="0 0 40 40" width="44" height="44">' +
-      '<g class="cmp-rot">' +
-      '<polygon points="20,5 24,20 20,17 16,20" fill="#ea4335"/>' +   // N (red)
-      '<polygon points="20,35 16,20 20,23 24,20" fill="#9aa0a6"/>' +   // S (grey)
-      '<text x="20" y="13" text-anchor="middle" font-size="7" font-weight="700" fill="#ea4335" font-family="sans-serif">N</text>' +
-      '</g></svg>';
-    compassEl = el;
-    L.DomEvent.disableClickPropagation(el);
-    // click = reset bearing to north
-    el.addEventListener("click", (e) => {
-      e.preventDefault();
-      map.setBearing(0);
-      updateCompass();
-    });
-    // drag to rotate
-    let dragging = false, startX = 0, startBearing = 0;
-    el.addEventListener("pointerdown", (e) => {
-      dragging = true; startX = e.clientX; startBearing = map.getBearing();
-      el.setPointerCapture(e.pointerId);
-    });
-    el.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      map.setBearing(startBearing + (e.clientX - startX));
-      updateCompass();
-    });
-    el.addEventListener("pointerup", () => { dragging = false; });
-    updateCompass();
-    return el;
-  },
-});
 function updateCompass() {
-  if (!compassEl) return;
+  if (!compassEl || !map) return;
   const g = compassEl.querySelector(".cmp-rot");
   if (g) g.setAttribute("transform", `rotate(${map.getBearing ? map.getBearing() : 0} 20 20)`);
 }
-map.addControl(new CompassControl());
-map.on("rotate", updateCompass);
 
-// "me" marker (current spoofed position)
-const meIcon = L.divIcon({ className: "", html: '<div class="me-dot"></div>', iconSize: [18, 18], iconAnchor: [9, 9] });
-const marker = L.marker(START, { draggable: true, icon: meIcon, zIndexOffset: 1000 }).addTo(map);
+function bootMap() {
+  map = L.map("map", {
+    zoomControl: false, worldCopyJump: true,   // custom zoom buttons (see below)
+    rotate: true, touchRotate: true, bearing: 0,
+    rotateControl: false,   // we render our own styled compass
+  }).setView(START, 13);
+
+  // ---- custom zoom +/- buttons (fully self-styled, no Leaflet divider quirks) ----
+  const ZoomControl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd() {
+      const el = L.DomUtil.create("div", "zoom-ctl");
+      el.innerHTML =
+        '<button class="zoom-btn" id="zoomIn" title="放大" aria-label="zoom in">' +
+        '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>' +
+        '<button class="zoom-btn" id="zoomOut" title="缩小" aria-label="zoom out">' +
+        '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg></button>';
+      L.DomEvent.disableClickPropagation(el);
+      el.querySelector("#zoomIn").addEventListener("click", (e) => { e.preventDefault(); map.zoomIn(); });
+      el.querySelector("#zoomOut").addEventListener("click", (e) => { e.preventDefault(); map.zoomOut(); });
+      return el;
+    },
+  });
+  map.addControl(new ZoomControl());
+
+  // tile layers keyed by a stable id; display names come from i18n
+  tileLayers = {
+    standard: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: "© OpenStreetMap" }),
+    dark: L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+      { maxZoom: 20, subdomains: "abcd", attribution: "© OpenStreetMap © CARTO" }),
+    light: L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+      { maxZoom: 20, subdomains: "abcd", attribution: "© OpenStreetMap © CARTO" }),
+    satellite: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      { maxZoom: 19, attribution: "© Esri" }),
+  };
+  tileLayers[currentLayer].addTo(map);
+
+  // Google-Maps-style thumbnail layer switcher (custom Leaflet control)
+  const LayerSwitcher = L.Control.extend({
+    options: { position: "bottomleft" },
+    onAdd() {
+      const el = L.DomUtil.create("div", "gm-layers");
+      L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.disableScrollPropagation(el);
+      layerSwitcherEl = el;
+      renderLayerSwitcher();
+      return el;
+    },
+  });
+  map.addControl(new LayerSwitcher());
+
+  // ---- Recenter button: fly back to the current spoofed marker ----
+  const RecenterControl = L.Control.extend({
+    options: { position: "bottomleft" },
+    onAdd() {
+      const el = L.DomUtil.create("div", "map-recenter");
+      el.title = "回到当前位置";
+      // navigation-style triangle/arrow icon
+      el.innerHTML =
+        '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"><path d="M12 3l7.5 16.5a.6.6 0 0 1-.8.8L12 17l-6.7 3.3a.6.6 0 0 1-.8-.8z"/></svg>';
+      L.DomEvent.disableClickPropagation(el);
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        map.setView([pos.lat, pos.lon], Math.max(map.getZoom(), 16), { animate: true });
+      });
+      return el;
+    },
+  });
+  map.addControl(new RecenterControl());
+
+  // ---- Compass: shows bearing, drag-free reset-to-north; map is rotatable ----
+  const CompassControl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd() {
+      const el = L.DomUtil.create("div", "map-compass");
+      el.title = "指南针（点击回正北，按住拖动旋转地图）";
+      el.innerHTML =
+        '<svg viewBox="0 0 40 40" width="44" height="44">' +
+        '<g class="cmp-rot">' +
+        '<polygon points="20,5 24,20 20,17 16,20" fill="#ea4335"/>' +   // N (red)
+        '<polygon points="20,35 16,20 20,23 24,20" fill="#9aa0a6"/>' +   // S (grey)
+        '<text x="20" y="13" text-anchor="middle" font-size="7" font-weight="700" fill="#ea4335" font-family="sans-serif">N</text>' +
+        '</g></svg>';
+      compassEl = el;
+      L.DomEvent.disableClickPropagation(el);
+      // click = reset bearing to north
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        map.setBearing(0);
+        updateCompass();
+      });
+      // drag to rotate
+      let dragging = false, startX = 0, startBearing = 0;
+      el.addEventListener("pointerdown", (e) => {
+        dragging = true; startX = e.clientX; startBearing = map.getBearing();
+        el.setPointerCapture(e.pointerId);
+      });
+      el.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        map.setBearing(startBearing + (e.clientX - startX));
+        updateCompass();
+      });
+      el.addEventListener("pointerup", () => { dragging = false; });
+      updateCompass();
+      return el;
+    },
+  });
+  map.addControl(new CompassControl());
+  map.on("rotate", updateCompass);
+
+  // "me" marker (current spoofed position)
+  const meIcon = L.divIcon({ className: "", html: '<div class="me-dot"></div>', iconSize: [18, 18], iconAnchor: [9, 9] });
+  marker = L.marker(START, { draggable: true, icon: meIcon, zIndexOffset: 1000 }).addTo(map);
+
+  // ---- map click — behaves differently per mode ----
+  map.on("click", (e) => {
+    if (mode === "route") addWaypoint(e.latlng.lat, e.latlng.lng);
+    else teleport(e.latlng.lat, e.latlng.lng, false);
+  });
+  marker.on("drag", (e) => { const ll = e.target.getLatLng(); setMarker(ll.lat, ll.lng); });
+  marker.on("dragend", () => { resumeSpoof(); sendLocation(pos.lat, pos.lon); });
+}
 
 // ============================================================================
 // STATE
@@ -331,6 +440,13 @@ let curState = "idle";       // last known backend state (for button logic)
 
 // ---------- position send (coalesced, latest-wins) ----------
 let pending = null, sending = false, lastSent = 0;
+// Set by "restore real GPS". The route walk streams ~10 POSTs/second, and the
+// backend treats ANY /api/set as "cancel the pending clear" -- so without this
+// gate the clear reached the phone and the very next frame of the walk put it
+// straight back on the fake coordinate. The button looked dead because the
+// spoof resumed within ~100ms. Cleared again the moment the user deliberately
+// asks for a new position (map click, drag, joystick, walk).
+let spoofSuspended = false;
 async function flush() {
   if (sending) return;
   if (pending == null) return;
@@ -346,27 +462,27 @@ async function flush() {
   sending = false;
   if (pending != null) flush();
 }
-function sendLocation(lat, lon) { pending = { lat, lon }; flush(); }
+function sendLocation(lat, lon) {
+  if (spoofSuspended) return;        // after a clear: stay on real GPS
+  pending = { lat, lon }; flush();
+}
+// Every deliberate "put the device HERE" action calls this first, so spoofing
+// resumes only on user intent -- never on a stray in-flight frame.
+function resumeSpoof() { spoofSuspended = false; }
 
 function setMarker(lat, lon, pan = false) {
   pos.lat = lat; pos.lon = clampLon(lon);
-  marker.setLatLng([pos.lat, pos.lon]);
-  if (pan) map.panTo([pos.lat, pos.lon], { animate: true });
+  // the map may not exist (Leaflet failed to load) — the coordinate readout and
+  // the position sender still work, which is what actually spoofs the device
+  if (marker) marker.setLatLng([pos.lat, pos.lon]);
+  if (pan && map) map.panTo([pos.lat, pos.lon], { animate: true });
   const t = `${fmt(pos.lat)}, ${fmt(pos.lon)}`;
   $("curCoord").textContent = t;
   $("curCoordMini").textContent = "";
 }
-function teleport(lat, lon, pan = true) { setMarker(lat, lon, pan); sendLocation(lat, clampLon(lon)); }
-
-// ============================================================================
-// MAP CLICK — behaves differently per mode
-// ============================================================================
-map.on("click", (e) => {
-  if (mode === "route") addWaypoint(e.latlng.lat, e.latlng.lng);
-  else teleport(e.latlng.lat, e.latlng.lng, false);
-});
-marker.on("drag", (e) => { const ll = e.target.getLatLng(); setMarker(ll.lat, ll.lng); });
-marker.on("dragend", () => sendLocation(pos.lat, pos.lon));
+function teleport(lat, lon, pan = true) { userMovedMap = true; resumeSpoof(); setMarker(lat, lon, pan); sendLocation(lat, clampLon(lon)); }
+// centre the map if there is one; a no-op when Leaflet failed to load
+function focusMap(lat, lon, zoom = 17) { if (map) map.setView([lat, lon], zoom); }
 
 // ============================================================================
 // CONNECT / CLEAR
@@ -379,6 +495,12 @@ $("btnConnect").addEventListener("click", async () => {
 $("btnClear").addEventListener("click", async () => {
   const btn = $("btnClear");
   if (btn.disabled) return;
+  // Order matters. Stop the route walk and gate the sender BEFORE the clear
+  // request goes out: the walk's next frame would otherwise re-spoof the device
+  // the instant the clear landed.
+  stopWalk();
+  spoofSuspended = true;
+  pending = null;                   // drop anything already queued
   btn.disabled = true;
   const orig = btn.textContent;
   btn.textContent = t("btn.resetting");
@@ -451,7 +573,13 @@ function parseLatLon(s) {
 }
 
 async function searchNominatim(q) {
-  const lang = hasCJK(q) ? "zh" : "en";
+  // Nominatim's accept-language takes any BCP-47 tag and simply falls back to
+  // the local name when it has no translation -- so the UI language can go
+  // straight through. Asking in the language you are reading the app in is the
+  // whole point: a French user searching "Munich" wants "Munich", not "München".
+  // CJK queries keep their script preference even in a non-CJK UI, since a
+  // Chinese place name is most useful rendered in Chinese.
+  const lang = hasCJK(q) ? (CJK_LANGS.has(LANG) ? LANG : "zh") : LANG;
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=6&accept-language=${lang}&q=${encodeURIComponent(q)}`;
   const r = await fetch(url, { headers: { "Accept-Language": lang } });
   const list = await r.json();
@@ -461,11 +589,22 @@ async function searchNominatim(q) {
     lat: +it.lat, lon: +it.lon,
   }));
 }
+// Photon accepts ONLY these. Sending anything else does not degrade to English
+// -- it returns a validation error object with no `features` array, i.e. search
+// silently finds nothing. Verified against the live API: lang=es/ru/ko/pt all
+// answer {"lang":[{"message":"Language is not supported..."}]}.
+const PHOTON_LANGS = new Set(["de", "en", "fr"]);
+
 async function searchPhoton(q) {
-  const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6&lang=en`;
+  // "default" asks Photon for each place's own local name, which is a better
+  // answer for an unsupported UI language than forcing everything to English.
+  const lang = PHOTON_LANGS.has(LANG) ? LANG : "default";
+  const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6&lang=${lang}`;
   const r = await fetch(url);
   const d = await r.json();
-  return (d.features || []).map((f) => {
+  // An error object (bad lang, rate limit) has no `features`; treat it as
+  // "no results" rather than letting .map throw and kill the whole search.
+  return (Array.isArray(d && d.features) ? d.features : []).map((f) => {
     const p = f.properties || {}, c = f.geometry.coordinates;
     const parts = [p.street, p.city, p.state, p.country].filter(Boolean);
     return { name: p.name || parts[0] || "?", sub: parts.join(", "), lat: c[1], lon: c[0] };
@@ -520,7 +659,7 @@ async function doSearch(q, enter) {
   const ll = parseLatLon(q);
   if (ll) {
     hideResults();
-    map.setView([ll.lat, ll.lon], 17);
+    focusMap(ll.lat, ll.lon);
     teleport(ll.lat, ll.lon);
     pushHistory({ name: `${fmt(ll.lat, 4)}, ${fmt(ll.lon, 4)}`, lat: ll.lat, lon: ll.lon });
     return;
@@ -586,7 +725,7 @@ function hideResults() { results.classList.remove("show"); activeIdx = -1; }
 function pick(it) {
   hideResults();
   searchBox.value = "";
-  map.setView([it.lat, it.lon], 17);
+  focusMap(it.lat, it.lon);
   teleport(it.lat, it.lon);
   pushHistory(it);
 }
@@ -632,7 +771,7 @@ function renderFavs() {
     c.className = "chip";
     c.innerHTML = `<span>⭐ ${escapeHtml(f.name)}</span> <span class="x" title="${t("fav.delete")}">×</span>`;
     c.querySelector("span:first-child").addEventListener("click", () => {
-      map.setView([f.lat, f.lon], 17); teleport(f.lat, f.lon);
+      focusMap(f.lat, f.lon); teleport(f.lat, f.lon);
     });
     c.querySelector(".x").addEventListener("click", (e) => {
       e.stopPropagation(); favs.splice(i, 1); LS.set("favs", favs); renderFavs();
@@ -642,13 +781,48 @@ function renderFavs() {
   const add = document.createElement("span");
   add.className = "chip add";
   add.innerHTML = t("fav.add");
-  add.addEventListener("click", () => {
-    const name = prompt(t("fav.prompt"), "");
-    if (name == null) return;
-    favs.unshift({ name: name.trim() || `${fmt(pos.lat, 4)},${fmt(pos.lon, 4)}`, lat: pos.lat, lon: pos.lon });
-    favs = favs.slice(0, 12); LS.set("favs", favs); renderFavs();
-  });
+  add.addEventListener("click", () => beginFavEdit(add));
   box.appendChild(add);
+}
+
+// Naming a favorite used to call prompt(). In WebView2 prompt() NEVER returns —
+// no dialog, no exception, the JS thread just hangs and the app is dead until
+// killed. So the add-chip morphs into a text input in place: Enter commits,
+// Escape or blur cancels. Same chip geometry, so the panel never reflows.
+function beginFavEdit(chip) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "chip-input";
+  input.placeholder = t("fav.prompt");
+  input.maxLength = 40;
+  chip.classList.remove("add");
+  chip.classList.add("editing");
+  chip.innerHTML = "";
+  chip.appendChild(input);
+
+  let done = false;                      // blur fires after Enter too — commit once
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    if (commit) {
+      favs.unshift({
+        name: name || `${fmt(pos.lat, 4)},${fmt(pos.lon, 4)}`,
+        lat: pos.lat, lon: pos.lon,
+      });
+      favs = favs.slice(0, 12);
+      LS.set("favs", favs);
+    }
+    renderFavs();                        // rebuilds the chip row, editor included
+  };
+  input.addEventListener("keydown", (e) => {
+    // keep WASD/Shift out of the movement handler while typing
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(false));
+  input.focus();
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -659,6 +833,8 @@ let dir = { x: 0, y: 0 };
 let shiftHeld = false;
 
 function moveByMeters(dEast, dNorth) {
+  userMovedMap = true;
+  resumeSpoof();
   const dLat = dNorth / 111320;
   const dLon = dEast / (111320 * Math.cos(pos.lat * Math.PI / 180) || 1e-6);
   const lat = Math.max(-90, Math.min(90, pos.lat + dLat));
@@ -686,6 +862,7 @@ function tick() {
 }
 requestAnimationFrame(tick);
 function keepInView() {
+  if (!map || !marker) return;
   if (map.getBounds && !map.getBounds().pad(-0.2).contains(marker.getLatLng()))
     map.panTo(marker.getLatLng(), { animate: false });
 }
@@ -712,6 +889,18 @@ window.addEventListener("keyup", (e) => {
   if (k === "shift") shiftHeld = false;
   keys.delete(k); recomputeKeyDir();
 });
+// Alt+Tab (or minimizing, or clicking the phone) while holding a key means the
+// keyup lands in the other window and never reaches us — the avatar would walk
+// forever, at 3x if Shift was down. In a windowed app switching away mid-move
+// is normal, so drop all held keys whenever we lose focus or visibility.
+function releaseAllKeys() {
+  if (!keys.size && !shiftHeld) return;
+  keys.clear();
+  shiftHeld = false;
+  recomputeKeyDir();
+}
+window.addEventListener("blur", releaseAllKeys);
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAllKeys(); });
 
 // joystick
 const joy = $("joy"), nub = $("joyNub");
@@ -745,6 +934,7 @@ function wpIcon(i) {
   return L.divIcon({ className: "", html: `<div class="wp-pin"><span>${label}</span></div>`, iconSize: [26, 26], iconAnchor: [13, 24] });
 }
 function addWaypoint(lat, lon) {
+  if (!map) return;   // waypoints are placed by clicking the map; no map, no waypoints
   const m = L.marker([lat, lon], { icon: wpIcon(waypoints.length), draggable: true }).addTo(map);
   const wp = { lat, lon, marker: m };
   m.on("dragend", () => { const ll = m.getLatLng(); wp.lat = ll.lat; wp.lon = ll.lng; renderWaypoints(); clearRouteLine(); });
@@ -762,7 +952,7 @@ function addWaypoint(lat, lon) {
 function removeWaypoint(wp) {
   const i = waypoints.indexOf(wp);
   if (i < 0) return;
-  map.removeLayer(wp.marker);
+  if (map) map.removeLayer(wp.marker);
   waypoints.splice(i, 1);
   renderWaypoints();
   clearRouteLine();
@@ -774,7 +964,7 @@ function renderWaypoints() {
   list.innerHTML = "";
   if (!waypoints.length) { list.innerHTML = '<li class="empty" id="wpEmpty">' + t("route.empty") + '</li>'; }
   waypoints.forEach((wp, i) => {
-    wp.marker.setIcon(wpIcon(i));
+    if (wp.marker) wp.marker.setIcon(wpIcon(i));
     const li = document.createElement("li");
     li.draggable = true;
     li.dataset.i = i;
@@ -812,7 +1002,7 @@ function renderWaypoints() {
   $("btnWalk").disabled = routeCoords.length < 2;
 }
 function clearRouteLine() {
-  if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+  if (routeLine && map) { map.removeLayer(routeLine); routeLine = null; }
   routeCoords = [];
   $("routeInfo").classList.add("hidden");
   $("btnWalk").disabled = true;
@@ -820,16 +1010,47 @@ function clearRouteLine() {
 
 $("btnClearRoute").addEventListener("click", () => {
   stopWalk();
-  waypoints.forEach((wp) => map.removeLayer(wp.marker));
+  if (map) waypoints.forEach((wp) => map.removeLayer(wp.marker));
   waypoints = [];
   clearRouteLine();
   renderWaypoints();
 });
 
+// ============================================================================
+// IN-PAGE NOTICES — never alert()
+// ============================================================================
+// alert() pops a bare untitled Win32 box AND hard-blocks every bit of JS until
+// it is dismissed — including the position sender and the status poll. Route
+// planning hits the public OSRM rate limit routinely, so this fired in normal
+// use. Notices now render into the panel using the .dm-banner styling.
+let noticeTimer = null;
+function showNotice(msg, kind = "error", ms = 7000) {
+  const el = $("routeNotice");
+  if (!el) return;
+  clearTimeout(noticeTimer);
+  el.textContent = (kind === "error" ? "⚠️ " : "ℹ️ ") + msg;
+  el.className = "dm-banner inline show " + kind;
+  // auto-dismiss so a stale error doesn't sit there forever
+  noticeTimer = setTimeout(() => {
+    el.classList.add("fading");
+    noticeTimer = setTimeout(() => { el.className = "dm-banner inline"; el.textContent = ""; }, 300);
+  }, ms);
+}
+function clearNotice() {
+  clearTimeout(noticeTimer);
+  const el = $("routeNotice");
+  if (el) { el.className = "dm-banner inline"; el.textContent = ""; }
+}
+
 $("btnPlan").addEventListener("click", planRoute);
 async function planRoute() {
-  if (waypoints.length < 2) { alert(t("route.needTwo")); return; }
-  const profile = $("routeProfile").value;
+  if (waypoints.length < 2) { showNotice(t("route.needTwo")); return; }
+  clearNotice();
+  // The route-type selector was removed: OSRM's public demo server only has
+  // the driving graph loaded, so "walking"/"cycling" returned the SAME road
+  // geometry as driving -- a choice that looked meaningful and never was.
+  // Walking speed stays user-controlled via the speed buttons.
+  const profile = "driving";
   const coordStr = waypoints.map((w) => `${w.lon},${w.lat}`).join(";");
   const url = `https://router.project-osrm.org/route/v1/${profile}/${coordStr}?overview=full&geometries=geojson`;
   $("btnPlan").textContent = t("btn.planning"); $("btnPlan").disabled = true;
@@ -840,17 +1061,20 @@ async function planRoute() {
     const route = d.routes[0];
     const latlngs = route.geometry.coordinates.map((c) => [c[1], c[0]]);
     clearRouteLine();
-    routeLine = L.polyline(latlngs, { color: "#388bfd", weight: 5, opacity: 0.85 }).addTo(map);
-    map.fitBounds(routeLine.getBounds().pad(0.15));
+    if (map) {
+      routeLine = L.polyline(latlngs, { color: "#388bfd", weight: 5, opacity: 0.85 }).addTo(map);
+      map.fitBounds(routeLine.getBounds().pad(0.15));
+    }
     routeCoords = densify(latlngs, 5); // ~5m spacing for smooth walking
     $("riDist").textContent = (route.distance / 1000).toFixed(2) + " km";
     $("riTime").textContent = fmtDur(route.duration);
     $("routeInfo").classList.remove("hidden");
     $("btnWalk").disabled = false;
   } catch (e) {
-    alert(t("route.planFail") + e.message + "\n" + t("route.osrmNote"));
+    showNotice(t("route.planFail") + e.message + " " + t("route.osrmNote"));
   } finally {
-    $("btnPlan").textContent = "规划路线"; $("btnPlan").disabled = false;
+    // was hardcoded zh — reset from the dictionary so en/ja don't get 规划路线
+    $("btnPlan").textContent = t("btn.plan"); $("btnPlan").disabled = false;
   }
 }
 function fmtDur(sec) {
@@ -890,6 +1114,7 @@ $("btnWalk").addEventListener("click", startWalk);
 $("btnStop").addEventListener("click", stopWalk);
 async function startWalk() {
   if (routeCoords.length < 2 || walking) return;
+  resumeSpoof();
   walking = true; walkAbort = false;
   $("btnWalk").disabled = true; $("btnStop").disabled = false;
   $("walkProgress").classList.remove("hidden");
@@ -1000,15 +1225,56 @@ function applyStatus(s) {
     banner.className = "dm-banner";
   }
 }
-setInterval(poll, 1500);
-poll();
 
 // ============================================================================
 // INIT
 // ============================================================================
+// ORDER MATTERS. The map bootstrap used to run at the top of this file, so any
+// failure there (Leaflet not loaded) threw before this block and left the user
+// with a half-rendered panel: no theme button, an EMPTY language menu, no
+// favorites and not one word of explanation. The panel is now wired FIRST and
+// the map is booted last, inside a try, so a dead map costs you the map only.
 setupThemeToggle();
 setupLangSelector();
+setupHelp();
 applyI18n();
-relabelLayers();     // apply translated layer names
 renderFavs();
 setMarker(START[0], START[1]);
+
+try {
+  if (typeof L === "undefined") throw new Error("Leaflet (vendor/leaflet.js) did not load");
+  bootMap();
+  relabelLayers();     // apply translated layer names
+} catch (e) {
+  // No console in a WebView2 window, so say it on the page instead.
+  showMapFailure();
+  applyI18n();         // fill in the failure banner's translated strings
+}
+
+// ---- opening map view from a coarse IP lookup ------------------------------
+// Why not navigator.geolocation? It throws a permission prompt at the user
+// before they have done anything, and in a WebView the prompt is easy to miss
+// and impossible to re-trigger. This is silent, needs no permission, and is
+// only ever used to CHOOSE WHERE TO LOOK.
+//
+// It deliberately does NOT spoof: setMarker() moves the pin and the readout
+// without POSTing /api/set, so the device stays on its real GPS until the user
+// actually asks for something. Opening the app must never move your phone.
+async function locateOnStartup() {
+  let d;
+  try {
+    const r = await fetch("/api/iploc");
+    if (!r.ok) return;
+    d = await r.json();
+  } catch (e) { return; }                 // offline / blocked -> keep START
+  if (!d || typeof d.lat !== "number" || typeof d.lon !== "number") return;
+  if (userMovedMap) return;               // the user got there first; leave them alone
+  setMarker(d.lat, d.lon, false);         // NOT teleport(): view only, no spoof
+  if (map) map.setView([d.lat, d.lon], 12);
+}
+locateOnStartup();
+
+// status polling — starts last so a map failure can't stop the device UI
+setInterval(poll, 1500);
+poll();
+

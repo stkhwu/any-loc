@@ -30,6 +30,19 @@ platforms/*/build/
 # ---- Editor ----
 .idea/
 .vscode/
+# Local AI/editor tooling config (launch profiles etc). Machine-local, not source.
+.claude/
 
 # Stale build fragment from an earlier Windows onedir build (not source)
 AnyLoc-App/
+
+# ---- Local scratch / verification scripts (not shipped) ----
+# One-off scripts used to prove the windowed-build behaviour (teardown really
+# restores GPS, the None-stream world works, the mutex blocks a 2nd instance).
+# Handy to keep locally, but they are not part of the app.
+.scratch/
+
+# ---- Windows onefile unpack dir (runtime_tmpdir, see AnyLoc.spec) ----
+# The onefile exe unpacks here instead of %TEMP% because WDAC blocks loading
+# DLLs from %TEMP%. Never inside the repo, but ignore it if someone points it here.
+runtime-*/

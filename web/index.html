@@ -4,8 +4,11 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>AnyLoc · 定位模拟</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<!-- Leaflet is vendored under web/vendor/ on purpose: this ships as a desktop
+     window, and a CDN fetch means "no internet = blank dead panel". Local files
+     need no integrity/crossorigin (those only mean something for a remote
+     origin). Verified against the published hashes before vendoring. -->
+<link rel="stylesheet" href="vendor/leaflet.css" />
 <style>
   /* ===== Theme variables ===== */
   :root, [data-theme="light"] {
@@ -46,15 +49,11 @@
   #panel::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
 
   /* header */
-  .head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+  .head{display:flex;align-items:center;justify-content:space-between;gap:10px}
   .head .title{min-width:0}
   h1{font-size:20px;margin:0;display:flex;align-items:center;gap:8px;font-weight:600;letter-spacing:-.2px}
   h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none;transition:.3s}
   h1 .brand span{color:var(--blue)}
-  /* reserve space for up to 2 lines so switching language doesn't shift the
-     rest of the panel up/down (zh=1 line, en/ja=2 lines) */
-  .sub{color:var(--muted);font-size:12.5px;margin-top:3px;line-height:1.4;
-    min-height:3em;display:flex;align-items:flex-start}
   .head-actions{display:flex;gap:8px;flex:none;align-items:center}
   .icon-btn{display:flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0;
     border-radius:50%;background:var(--panel);border:1px solid var(--border2);color:var(--muted);
@@ -164,6 +163,14 @@
   .chip .x{color:var(--faint);font-size:15px;line-height:1}
   .chip .x:hover{color:var(--redText)}
   .chip.add{color:var(--muted);border-style:dashed;background:transparent}
+  /* The "name this spot" editor. WebView2 never returns from prompt() (the JS
+     thread hangs forever), so naming happens inline: the add-chip turns INTO a
+     text input that keeps the exact chip geometry, so nothing reflows. */
+  .chip.editing{padding:0;border-style:solid;background:var(--inset2)}
+  .chip-input{width:150px;background:transparent;border:none;outline:none;color:var(--text);
+    font-size:12.5px;font-family:inherit;padding:6px 12px;border-radius:20px}
+  .chip.editing:focus-within{border-color:var(--blue);background:var(--panel);
+    box-shadow:0 0 0 3px var(--blueSoft)}
 
   /* ---------- mode tabs ---------- */
   .tabs{display:flex;background:transparent;border-bottom:1px solid var(--border);padding:0;gap:0;margin-bottom:2px}
@@ -221,6 +228,21 @@
   .progress{height:6px;background:var(--inset);border-radius:4px;overflow:hidden;margin-top:10px}
   .progress>div{height:100%;width:0;background:var(--blue);transition:width .1s}
   .empty{color:var(--muted);font-size:12.5px;text-align:center;padding:8px 0}
+
+  /* Inline notice — the stand-in for alert(), which hard-blocks all JS in
+     WebView2. Reuses the .dm-banner palette; `inline` drops the 4.6em min-height
+     the device banner needs for layout stability, and fades itself out. */
+  .dm-banner.inline{min-height:0;margin-top:9px;transition:opacity .3s}
+  .dm-banner.inline.fading{opacity:0}
+
+  /* Shown only when Leaflet failed to load (offline / vendor files missing).
+     Without this the map div is just an empty grey rectangle with no clue. */
+  #mapFail{display:none;height:100%;align-items:center;justify-content:center;padding:32px}
+  #mapFail.show{display:flex;flex:1;background:var(--mapbg)}
+  #mapFail .box{max-width:420px;text-align:center;background:var(--redSoft);color:var(--redText);
+    border-radius:12px;padding:18px 20px;font-size:13px;line-height:1.6;box-shadow:var(--shadow)}
+  #mapFail .box b{display:block;font-size:14px;margin-bottom:6px}
+
 
   .foot{margin-top:auto;font-size:11px;color:var(--faint);line-height:1.7;padding-top:4px}
   .warn{color:var(--amberText);font-weight:500}
@@ -290,6 +312,49 @@
   .gm-layer-opt.on .gm-opt-thumb{border-color:var(--blue)}
   .gm-opt-label{font-size:11.5px;color:var(--muted);font-weight:500}
   .gm-layer-opt.on .gm-opt-label{color:var(--blueText);font-weight:600}
+
+  /* ---------- help / getting-started overlay ---------- */
+  /* Sits above the language menu (1500) and the search results (1200); the map
+     panes top out well below this. Backdrop is a real element rather than a
+     ::before so the click-to-dismiss target is unambiguous. */
+  .help-ov{position:fixed;inset:0;z-index:2000;display:none;align-items:center;justify-content:center;
+    background:rgba(32,33,36,.45);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);padding:24px}
+  .help-ov.show{display:flex}
+  .help-modal{background:var(--panel);border:1px solid var(--border);border-radius:16px;
+    width:min(560px,100%);max-height:min(78vh,720px);display:flex;flex-direction:column;
+    box-shadow:var(--shadow);overflow:hidden}
+  .help-head{display:flex;align-items:center;justify-content:space-between;gap:12px;
+    padding:16px 18px 12px;border-bottom:1px solid var(--border);flex:none}
+  .help-head h3{margin:0;font-size:15.5px;font-weight:600;color:var(--text);letter-spacing:-.2px}
+  .help-close{width:32px;height:32px;padding:0;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;background:var(--panel);border:1px solid var(--border2);color:var(--muted);
+    box-shadow:none;flex:none;font-size:17px;line-height:1}
+  .help-close:hover{background:var(--inset2);color:var(--text2)}
+  .help-body{overflow-y:auto;padding:4px 18px 18px}
+  .help-body::-webkit-scrollbar{width:8px}
+  .help-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+  /* platform tabs reuse the .tabs look from the movement card */
+  .help-tabs{display:flex;border-bottom:1px solid var(--border);margin:0 0 14px;position:sticky;top:0;
+    background:var(--panel);z-index:1}
+  .help-tabs button{flex:1;background:transparent;border:none;border-bottom:2.5px solid transparent;
+    padding:11px 8px;font-size:13px;font-weight:600;color:var(--muted);border-radius:0;box-shadow:none}
+  .help-tabs button:hover{background:transparent;color:var(--text2)}
+  .help-tabs button.on{color:var(--blueText);border-bottom-color:var(--blue)}
+  /* numbered steps */
+  .help-steps{list-style:none;margin:0;padding:0;counter-reset:hstep}
+  .help-steps li{position:relative;padding:0 0 16px 34px;counter-increment:hstep}
+  .help-steps li::before{content:counter(hstep);position:absolute;left:0;top:0;width:23px;height:23px;
+    border-radius:50%;background:var(--blueSoft);color:var(--blueText);font-size:12px;font-weight:600;
+    display:flex;align-items:center;justify-content:center}
+  .help-steps li:last-child{padding-bottom:4px}
+  .help-steps .st{display:block;font-size:13.5px;font-weight:600;color:var(--text);margin:2px 0 3px}
+  .help-steps .sd{display:block;font-size:12.5px;line-height:1.65;color:var(--muted)}
+  .help-steps .sd code{background:var(--inset);border-radius:5px;padding:1px 5px;font-size:11.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text2)}
+  .help-note{margin-top:6px;background:var(--inset2);border:1px solid var(--border);border-radius:10px;
+    padding:11px 13px;font-size:12.5px;line-height:1.6;color:var(--muted)}
+  .help-sec{display:none}
+  .help-sec.on{display:block}
 </style>
 </head>
 <body>
@@ -298,9 +363,11 @@
     <div class="head">
       <div class="title">
         <h1><span class="dot" id="dot"></span> <span class="brand">Any<span>Loc</span></span></h1>
-        <div class="sub" data-i18n="app.sub">iOS 定位模拟 · 点地图即传送</div>
       </div>
       <div class="head-actions">
+        <button class="icon-btn" id="helpBtn" data-i18n-title="help.title" title="帮助">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.2"/><path d="M9.6 9.2a2.5 2.5 0 1 1 3.2 2.4c-.6.2-.9.7-.9 1.3v.6"/><circle cx="12" cy="17" r=".9" fill="currentColor" stroke="none"/></svg>
+        </button>
         <button class="icon-btn" id="themeBtn" title="Theme"></button>
         <div class="lang" id="langWrap">
           <button class="lang-btn" id="langBtn" title="Language / 语言 / 言語">
@@ -382,16 +449,6 @@
         <div class="hint" style="margin-top:10px" data-i18n="route.hint">
           在地图上依次点击设置途经点（A→B→C…），沿真实道路自动行走。
         </div>
-        <div class="row" style="margin-top:8px">
-          <div style="flex:1.4">
-            <label data-i18n="route.type">路线类型</label>
-            <select id="routeProfile">
-              <option value="walking" data-i18n="route.walking">步行路线</option>
-              <option value="cycling" data-i18n="route.cycling">骑行路线</option>
-              <option value="driving" selected data-i18n="route.driving">驾车路线</option>
-            </select>
-          </div>
-        </div>
         <ul class="wp-list" id="wpList"><li class="empty" id="wpEmpty" data-i18n="route.empty">还没有途经点</li></ul>
         <div class="route-info hidden" id="routeInfo">
           <span><span data-i18n="route.dist">距离</span> <b id="riDist">–</b></span>
@@ -409,6 +466,9 @@
         <label style="margin-top:8px;display:flex;align-items:center;gap:6px;cursor:pointer">
           <input type="checkbox" id="loopChk" style="width:auto"/> <span data-i18n="route.loop">循环行走</span>
         </label>
+        <!-- Route errors land here instead of alert(): a blocking Win32 dialog
+             would freeze all JS, and OSRM rate-limiting makes it a routine event. -->
+        <div class="dm-banner inline" id="routeNotice"></div>
       </div>
     </div>
 
@@ -421,13 +481,60 @@
       </div>
     </div>
 
+    <!-- Attribution for the tile + routing services. This lives in the panel
+         because the Leaflet attribution control's links are neutralized (a
+         top-level navigation in a window with no Back button strands the
+         user) — the credit text itself is a licensing obligation. -->
+    <div class="foot" data-i18n="foot.credit">地图数据 © OpenStreetMap · 路线 © OSRM</div>
+
   </div>
   <div id="map"></div>
+  <!-- Only ever shown when Leaflet itself failed to load; see bootMap(). -->
+  <div id="mapFail"><div class="box"><b data-i18n="map.failTitle">地图加载失败</b><span data-i18n="map.failBody">地图组件未能载入。其余功能仍可使用。</span></div></div>
 </div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate-src.js"></script>
+<!-- Getting-started guide. Lives outside #app so the fixed overlay is never
+     clipped by the panel's overflow:auto. Steps are data-i18n like the rest of
+     the UI, so they follow the language selector with no extra wiring. -->
+<div class="help-ov" id="helpOv" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+  <div class="help-modal">
+    <div class="help-head">
+      <h3 id="helpTitle" data-i18n="help.title">使用指南</h3>
+      <button class="help-close" id="helpClose" aria-label="Close">&#10005;</button>
+    </div>
+    <div class="help-body">
+      <div class="help-tabs">
+        <button id="helpTabIos" class="on" data-i18n="help.tab.ios">iPhone / iPad</button>
+        <button id="helpTabAnd" data-i18n="help.tab.android">Android</button>
+      </div>
+
+      <div class="help-sec on" id="helpSecIos">
+        <ol class="help-steps">
+          <li><span class="st" data-i18n="help.ios.s1">打开「开发者模式」</span><span class="sd" data-i18n="help.ios.s1d">设置 &gt; 隐私与安全性 &gt; 开发者模式 &gt; 打开。手机会重启。</span></li>
+          <li><span class="st" data-i18n="help.ios.s2">用数据线连接电脑</span><span class="sd" data-i18n="help.ios.s2d">直连的 USB 口通常比转接器更稳定。</span></li>
+          <li><span class="st" data-i18n="help.ios.s3">点「信任这台电脑」</span><span class="sd" data-i18n="help.ios.s3d">解锁手机，在弹窗里点「信任」并输入密码。</span></li>
+          <li><span class="st" data-i18n="help.ios.s4">点「连接」</span><span class="sd" data-i18n="help.ios.s4d">圆点变绿即表示已就绪。首次连接会下载开发者镜像，需要联网，可能要一分钟。</span></li>
+          <li><span class="st" data-i18n="help.ios.s5">点击地图即可改变定位</span><span class="sd" data-i18n="help.ios.s5d">也可以用摇杆或 WASD／方向键移动；按住 Shift 加速 3 倍。</span></li>
+        </ol>
+        <div class="help-note" data-i18n="help.ios.note">保持窗口开着，定位才会持续生效。关闭窗口或点「恢复真实定位」都会还原真实 GPS。</div>
+      </div>
+
+      <div class="help-sec" id="helpSecAnd">
+        <ol class="help-steps">
+          <li><span class="st" data-i18n="help.and.s1">打开「开发者选项」</span><span class="sd" data-i18n="help.and.s1d">设置 &gt; 关于手机 &gt; 连续点击「版本号」7 次。</span></li>
+          <li><span class="st" data-i18n="help.and.s2">打开「USB 调试」</span><span class="sd" data-i18n="help.and.s2d">设置 &gt; 系统 &gt; 开发者选项 &gt; USB 调试。小米／华为还需打开「USB 调试（安全设置）」。</span></li>
+          <li><span class="st" data-i18n="help.and.s3">用数据线连接电脑</span><span class="sd" data-i18n="help.and.s3d">在手机弹窗里点「允许 USB 调试」，并勾选「一律允许」。</span></li>
+          <li><span class="st" data-i18n="help.and.s4">点「连接」</span><span class="sd" data-i18n="help.and.s4d">需要 Android 11 或更新的系统。无需 root，也无需安装任何 App。</span></li>
+          <li><span class="st" data-i18n="help.and.s5">点击地图即可改变定位</span><span class="sd" data-i18n="help.and.s5d">也可以用摇杆或 WASD／方向键移动；按住 Shift 加速 3 倍。</span></li>
+        </ol>
+        <div class="help-note" data-i18n="help.and.note">保持窗口开着，定位才会持续生效。关闭窗口或点「恢复真实定位」都会还原真实 GPS。</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/leaflet.js"></script>
+<script src="vendor/leaflet-rotate-src.js"></script>
 <script src="i18n.js"></script>
 <script src="config.js"></script>
 <script src="app.js"></script>
