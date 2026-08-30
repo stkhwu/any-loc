@@ -1,1 +1,23 @@
+# AnyLoc runtime dependencies.
+#
+# Install with:  pip install -U -r requirements.txt
+#
+# pymobiledevice3 — the iOS side: RemoteXPC tunnel + DVT LocationSimulation.
+#   v10+ additionally enables the no-root userspace tunnel on macOS (see
+#   userspace_tunnel_supported() in src/launcher.py); on 9.x the app falls back
+#   to the elevated tunneld path automatically, so 9.x still works.
+#   It also brings uvicorn in transitively, which start_tunneld() uses directly.
 pymobiledevice3>=9.0.0
+
+# pywebview — the native app window (WKWebView on macOS, Edge WebView2 on
+#   Windows). src/gui.py imports it lazily inside run_window(), so running from
+#   source without it degrades to a browser window rather than failing. It is
+#   NOT optional for a packaged build: PyInstaller only bundles what it can see,
+#   and an .app/.exe built without it silently ships the browser fallback
+#   instead of a real window. Both build scripts refuse to build if it is
+#   missing for exactly that reason.
+pywebview>=5.0
+
+# Not listed on purpose:
+#   pyinstaller — build-only; the build scripts install it into platforms/<os>/.venv
+#   pillow      — only for scripts/make_icon.py, which regenerates the icons
