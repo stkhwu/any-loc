@@ -8,6 +8,7 @@ make_icon.py — 用代码生成 AnyLoc 应用图标。
 运行： python scripts/make_icon.py
 """
 import os
+import sys
 from PIL import Image, ImageDraw, ImageFont
 
 # this script lives in scripts/, so web/ is one level up (project root)
@@ -27,7 +28,33 @@ PANEL_EDGE = (232, 234, 237, 255)  # 底板极淡描边（浅灰，任务栏上�
 img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
 
+# ---- 0) macOS icon grid ------------------------------------------------------
+# macOS does NOT draw app icons edge-to-edge: every system icon leaves a ring of
+# transparent padding, and the Dock/Finder scale the full canvas. An icon that
+# fills its canvas therefore renders visibly LARGER than every neighbour, even
+# though the files are the same pixel size.
+#
+# Measured from the shipping system icons on this Mac (largest .icns variant):
+#     Notes / Maps / Safari  ->  opaque bbox (18, 21, 238, 241) of 256px
+#                            ->  body 85.9% of canvas, ~7% padding per side
+# AnyLoc was (0, 0, 1024, 1024) = 100%, which is exactly the "too big in the
+# Dock" bug. BODY_RATIO reproduces Apple's proportion instead of guessing.
+#
+# The 1px downward bias (top pad 21 vs side 18) is Apple's too — it optically
+# centres the shape once the Dock's reflection/label sit underneath.
+BODY_RATIO = 220.0 / 256.0        # 0.859 — the measured system ratio
+body = int(S * BODY_RATIO)
+pad_x = (S - body) // 2
+pad_y = pad_x + int(S * (3.0 / 256.0))   # nudge down ~3/256, as Apple does
+
+# Everything below is drawn into `img` in FULL-canvas coordinates; the whole
+# composition is scaled into the padded box at export time (see "icon grid"
+# below). Keeping the drawing code canvas-sized means the geometry constants
+# (pin radius, text size) stay readable and independent of the padding.
+
 # ---- 1) 白色圆角方块底 ----
+# 22% of the *body* is the macOS squircle radius; drawn at canvas scale here and
+# scaled down with everything else.
 radius = int(S * 0.22)
 d.rounded_rectangle([0, 0, S - 1, S - 1], radius=radius, fill=PANEL,
                     outline=PANEL_EDGE, width=max(2, int(S * 0.006)))
@@ -97,13 +124,65 @@ d.text((sx, ty), txt_any, font=font, fill=INK)
 d.text((sx + w_any, ty), txt_loc, font=font, fill=BLUE)
 
 # ---- 导出 ----
+# Compose the finished artwork into the macOS icon grid: scale the whole drawing
+# down to `body` px and paste it into a transparent S x S canvas at (pad_x,
+# pad_y). This is the step that makes the Dock render AnyLoc at the same visual
+# size as its neighbours — see the BODY_RATIO note at the top.
+art = img.resize((body, body), Image.LANCZOS)
+canvas = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+canvas.alpha_composite(art, (pad_x, pad_y))
+img = canvas
+
 preview = img.resize((256, 256), Image.LANCZOS)
 preview_path = os.path.join(OUT_DIR, "icon-256.png")
 preview.save(preview_path)
 
+# Windows: the .ico keeps the same padded artwork. Windows scales taskbar icons
+# to fit rather than assuming a fixed inset, so the padding is harmless there,
+# and one shared composition keeps the two platforms visually identical.
 ico_path = os.path.join(OUT_DIR, "icon.ico")
 img.save(ico_path, format="ICO",
          sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+
+# ---- macOS .icns ----
+# Built with Apple's own `iconutil` from a .iconset directory, which is the
+# format it insists on: each file must be named icon_<size>[@2x].png exactly.
+# Without an .icns the .app shows the generic blank-page icon in Finder and the
+# Dock. iconutil only exists on macOS, so this step is skipped elsewhere and the
+# Windows .ico above is unaffected.
+icns_path = os.path.join(OUT_DIR, "icon.icns")
+if sys.platform == "darwin":
+    import shutil
+    import subprocess
+    import tempfile
+
+    iconset = os.path.join(tempfile.mkdtemp(), "icon.iconset")
+    os.makedirs(iconset, exist_ok=True)
+    # (base size, @2x?) -> the pairs macOS expects for a complete iconset.
+    for size in (16, 32, 128, 256, 512):
+        img.resize((size, size), Image.LANCZOS).save(
+            os.path.join(iconset, f"icon_{size}x{size}.png"))
+        img.resize((size * 2, size * 2), Image.LANCZOS).save(
+            os.path.join(iconset, f"icon_{size}x{size}@2x.png"))
+    try:
+        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", icns_path],
+                       check=True, capture_output=True)
+        print("  图标 ICNS:", icns_path)
+    except Exception as e:
+        # iconutil can fail for reasons that have nothing to do with the
+        # artwork — a sandboxed/restricted environment refuses it even for a
+        # trivially valid iconset. Falling back to Pillow's own ICNS writer
+        # keeps `build-mac.sh` working instead of shipping a .app with the
+        # generic blank-page icon, which is a user-visible defect that the
+        # build otherwise happily passes (build-mac.sh only *warns* on a
+        # missing icon).
+        try:
+            img.save(icns_path, format="ICNS")
+            print("  图标 ICNS:", icns_path, "(Pillow fallback — iconutil 不可用)")
+        except Exception as e2:
+            print("  (.icns 生成失败 — iconutil:", e, "| Pillow:", e2, ")")
+    finally:
+        shutil.rmtree(os.path.dirname(iconset), ignore_errors=True)
 
 print("生成：")
 print("  预览 PNG:", preview_path)
